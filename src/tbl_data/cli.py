@@ -76,6 +76,64 @@ def sync(
 
 
 @app.command()
+def build(
+    season: str = "2026-27",
+    league: str = "tbl",
+    data: DataDir = None,
+    verbose: bool = False,
+) -> None:
+    """raw -> staged Parquet + DuckDB views, then cross-source validation."""
+    import polars as pl
+
+    from . import build as B
+    from . import validate as V
+    from .store.reader import RawReader
+
+    _setup_logging(verbose)
+    s = get_season(league, season)
+    root = data or data_dir()
+    m = Manifest(root / "manifest.sqlite")
+    scope = f"{s.league}/{s.key}"
+    played = [(r["match_id"], int(r["genius_id"]) if r["genius_id"] else None) for r in m.matches(scope, played_only=True)]
+    staged = B.build(RawReader(RawStore(root / "raw"), m, scope), s, played)
+    m.close()
+    out = B.write(staged, root, s)
+    checks = V.run_all(staged.tables, pl.DataFrame(staged.drift, schema=["object", "key", "n", "first_seen"]),
+                       staged.unmapped)
+    V.report(checks).write_parquet(out / "validation.parquet")
+
+    typer.echo(f"\nstaged -> {out}")
+    for name, df in staged.tables.items():
+        typer.echo(f"  {name:<16} {df.height:>7} rows")
+    typer.echo("\nvalidation")
+    for c in checks:
+        mark = "ok  " if c.ok else ("FAIL" if c.blocking else "note")
+        typer.echo(f"  {mark} {c.name:<22} {c.failures.height:>4} / {c.checked:<6} {c.description}")
+    with pl.Config(tbl_rows=5, tbl_width_chars=160):
+        for c in checks:
+            if not c.ok:
+                typer.echo(f"\n{c.name}:\n{c.failures.head(5)}")
+    typer.echo(f"\nquery: uv run tbl sql \"SELECT * FROM matches LIMIT 5\"   (DuckDB: {root / 'tbl.duckdb'})")
+    if any(c.blocking and not c.ok for c in checks):
+        raise typer.Exit(1)
+
+
+@app.command()
+def sql(query: str, data: DataDir = None) -> None:
+    """Run SQL against the staged DuckDB views."""
+    import duckdb
+
+    con = duckdb.connect(str((data or data_dir()) / "tbl.duckdb"), read_only=True)
+    try:
+        con.sql(query).show(max_rows=50, max_width=200)
+    except duckdb.Error as e:
+        typer.echo(f"{type(e).__name__}: {e}", err=True)
+        raise typer.Exit(1) from None
+    finally:
+        con.close()
+
+
+@app.command()
 def status(season: str = "2026-27", league: str = "tbl", data: DataDir = None) -> None:
     """Show what is in the raw store for a season."""
     s = get_season(league, season)

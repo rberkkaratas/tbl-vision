@@ -7,7 +7,10 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "duckdb>=2.0.0",
     "httpx>=0.28.1",
+    "pandera[polars]>=0.34.1",
+    "polars>=2.0.0",
     "seleniumbase==4.56.3",
     "stamina>=26.1.0",
     "structlog>=26.1.0",

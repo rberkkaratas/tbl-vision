@@ -28,6 +28,8 @@ uv run tbl sync --season 2026-27          # everything due: fixtures, played mat
 uv run tbl sync --max-requests 20         # small trial run
 uv run tbl sync --only genius             # Genius only (needs fixtures already fetched)
 uv run tbl status
+uv run tbl build                          # raw -> staged Parquet + DuckDB views + validation (~3 s)
+uv run tbl sql "SELECT * FROM matches LIMIT 5"
 ```
 
 TBF sits behind Cloudflare, so `sync` opens a Chrome window (SeleniumBase CDP
@@ -46,3 +48,31 @@ the box in that window, and otherwise stops; the next `sync` resumes where it le
 | 404 / empty | after 24 h · errors after 1 h |
 
 Genius requests send `If-None-Match`; a 304 stores nothing new.
+
+## Staged tables
+
+`~/data/tbl/staged/league=tbl/season=2026-27/*.parquet`, exposed as DuckDB views in
+`~/data/tbl/tbl.duckdb` (with `league`, `season` columns from the path).
+
+| Table | Grain | Source |
+|---|---|---|
+| `matches` | match | TBF fixture + header (officials, video), Genius attendance / period lengths |
+| `teams` | club-season (`team_season_id`, `club_id`) | TBF |
+| `players` | person (`player_id`, persistent) | TBF player list + profiles |
+| `match_teams` | team in match: box totals incl. team rebounds, second-chance / paint / bench points | Genius |
+| `period_scores` | team x period (Q1..Q4, OT1..) | Genius pbp |
+| `match_players` | player in match: box score, starter, `pno` | Genius, mapped to TBF ids |
+| `events` | play-by-play action, `elapsed_s`, qualifiers, running score | Genius |
+| `shots` | field goal attempt, raw x/y (0-100) | Genius |
+| `player_career` | player x season x competition | TBF |
+| `tbf_box`, `tbf_events`, `tbf_shots` | TBF copies, kept only for cross-checks | TBF |
+
+Keys: `match_id` = TBF matchId, `player_id` = TBF person id, `team_season_id` = TBF teamProcessId.
+Genius players are mapped to TBF ids by (team, jersey). Column names are English;
+TBF field quirks (`twoPointShots` = 2P made, `rivalFoul` = fouls drawn, ...) are decoded in `parse/tbf.py`.
+
+`tbl build` fails if a blocking check fails: TBF and Genius box scores equal, 1:1 player
+mapping, points add up, per-period points sum to the final, shots = FGA, TBF game-flow
+is a subset of Genius pbp, no unseen source fields. Informational notes (2026-27): one
+TBF minutes misattribution (345930), one incomplete TBF shot chart (345937), and old or
+national-team career rows without shot splits.
