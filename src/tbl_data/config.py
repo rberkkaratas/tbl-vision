@@ -46,6 +46,10 @@ def get_season(league: str, key: str) -> Season:
         raise KeyError(f"unknown season {league} {key}; known: {known}") from None
 
 
+# Hand-written fixes per match (version-controlled, unlike the data)
+OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "overrides"
+
+
 def data_dir() -> Path:
     """Data lives outside the repo; override with TBL_DATA_DIR."""
     return Path(os.environ.get("TBL_DATA_DIR", "~/data/tbl")).expanduser()

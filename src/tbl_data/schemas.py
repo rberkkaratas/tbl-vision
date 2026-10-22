@@ -316,3 +316,149 @@ TABLES: dict[str, type[pa.DataFrameModel]] = {
 
 def polars_schema(model: type[pa.DataFrameModel]) -> dict[str, pl.DataType]:
     return {name: col.dtype.type for name, col in model.to_schema().columns.items()}
+
+
+# -- enriched layer --------------------------------------------------------------------
+Lineup = pl.List(pl.Int32)
+
+
+class EventsEnriched(Events):
+    """Staged events in canonical order with lineups and possessions."""
+
+    seq: Int = pa.Field(ge=1)  # canonical order within the match
+    possession_no: Int = Opt()
+    offense_team_id: Int = Opt()
+    home_lineup: Lineup
+    away_lineup: Lineup
+    ft_trip_no: Int = Opt()
+    order_override: pl.Boolean  # moved by overrides/{match_id}.json
+
+    class Config:
+        strict = True
+        unique = ["match_id", "seq"]
+
+
+class Stints(pa.DataFrameModel):
+    match_id: Int
+    team_season_id: Int
+    stint_no: Int
+    period_ord: Int
+    start_seq: Int
+    start_s: pl.Float64 = Count()
+    end_s: pl.Float64 = Count()
+    seconds: pl.Float64 = Count()
+    lineup: Lineup
+    pts_for: Int = Count()
+    pts_against: Int = Count()
+    poss_for: Int = Count()
+    poss_against: Int = Count()
+
+    class Config:
+        strict = True
+
+
+class Possessions(pa.DataFrameModel):
+    match_id: Int
+    possession_no: Int = pa.Field(ge=1)
+    team_season_id: Int  # offense
+    period_ord: Int
+    start_seq: Int
+    end_seq: Int
+    start_s: pl.Float64 = Count()
+    end_s: pl.Float64 = Count()
+    duration_s: pl.Float64 = Count()
+    start_type: str = pa.Field(isin=["period_start", "after_made_fg", "after_made_ft", "after_defensive_rebound",
+                                     "after_steal", "after_turnover", "jumpball", "unsportsmanlike_foul", "inferred"])
+    end_type: str = pa.Field(isin=["made_fg", "made_ft", "defensive_rebound", "turnover", "period_end",
+                                   "jumpball", "unsportsmanlike_foul", "inferred", "game_end"])
+    pts: Int = Count()
+    pts_against: Int = Count()  # e.g. technical free throws by the defense
+    fga: Int = Count()
+    fg3a: Int = Count()
+    fta: Int = Count()
+    oreb: Int = Count()
+    tov: Int = Count()
+
+    class Config:
+        strict = True
+        unique = ["match_id", "possession_no"]
+
+
+class ShotsEnriched(Shots):
+    seq: Int = Opt()
+    elapsed_s: pl.Float64 = Opt()
+    clock_s: pl.Float64 = Opt()
+    x_m: pl.Float64 = pa.Field(ge=0, le=28)  # metres from the attacked baseline
+    y_m: pl.Float64 = pa.Field(ge=0, le=15)
+    distance_m: pl.Float64 = Count()  # from the basket centre
+    zone: str = pa.Field(isin=["rim", "paint", "midrange", "corner_3", "above_break_3", "heave"])
+    location_imputed: pl.Boolean  # tip-ins logged at Genius' default spot
+    assisted: pl.Boolean
+    assist_player_id: Int = Opt()
+    blocked: pl.Boolean
+    block_player_id: Int = Opt()
+    second_chance: pl.Boolean
+    fast_break: pl.Boolean
+    from_turnover: pl.Boolean
+    in_paint: pl.Boolean
+    fouled: pl.Boolean
+    possession_no: Int = Opt()
+    possession_elapsed_s: pl.Float64 = Opt()
+    margin_before: Int = Opt()  # shooting team's lead before the shot
+    offense_lineup: Lineup
+    defense_lineup: Lineup
+
+    class Config:
+        strict = True
+        unique = ["match_id", "action_number"]
+
+
+class FtTrips(pa.DataFrameModel):
+    match_id: Int
+    trip_no: Int
+    team_season_id: Int
+    shooter_id: Int
+    n_awarded: Int = pa.Field(ge=1, le=3)
+    attempts: Int = pa.Field(ge=1)
+    made: Int = Count()
+    trip_type: str = pa.Field(isin=["and_one", "shooting_2pt", "shooting_3pt", "shooting", "penalty",
+                                    "technical", "unsportsmanlike", "unknown"])
+    foul_action: Int = Opt()
+    foul_sub_type: str = Opt()
+    fouler_id: Int = Opt()
+    period_ord: Int
+    elapsed_s: pl.Float64
+    first_seq: Int
+    last_seq: Int
+    complete: pl.Boolean
+    possession_no: Int = Opt()
+
+    class Config:
+        strict = True
+        unique = ["match_id", "trip_no"]
+
+
+class EnrichIssues(pa.DataFrameModel):
+    match_id: Int
+    source: str = pa.Field(isin=["lineup", "possession", "override"])
+    issue: str
+    action_number: Int = Opt()
+    seq: Int = Opt()
+    team_season_id: Int = Opt()
+    player_id: Int = Opt()
+    period_label: str = Opt()
+    clock: str = Opt()
+    note: str = Opt()
+
+    class Config:
+        strict = True
+
+
+ENRICHED_TABLES: dict[str, type[pa.DataFrameModel]] = {
+    "events_enriched": EventsEnriched,
+    "stints": Stints,
+    "possessions": Possessions,
+    "shots_enriched": ShotsEnriched,
+    "ft_trips": FtTrips,
+    "enrich_issues": EnrichIssues,
+}

@@ -151,10 +151,10 @@ def _frame(name: str, rows: list[dict]) -> pl.DataFrame:
 
 
 # -- output ------------------------------------------------------------------------
-def write(staged: Staged, root: Path, season: Season) -> Path:
-    """Write Parquet under staged/league=../season=../ and refresh DuckDB views."""
+def write(staged: Staged, root: Path, season: Season, enriched: dict[str, pl.DataFrame] | None = None) -> Path:
+    """Write Parquet under {staged,enriched}/league=../season=../ and refresh DuckDB views."""
     out = root / "staged" / f"league={season.league}" / f"season={season.key}"
-    for name, df in staged.tables.items():
+    for name, df in {**staged.tables, **(enriched or {})}.items():
         # DuckDB's hive partition values silently replace same-named file columns
         if clash := set(df.columns) & HIVE_KEYS:
             raise ValueError(f"table {name!r} has columns {clash} that clash with hive partition keys")
@@ -163,6 +163,11 @@ def write(staged: Staged, root: Path, season: Season) -> Path:
         df.write_parquet(out / f"{name}.parquet")
     pl.DataFrame(staged.drift, schema={"object": pl.String, "key": pl.String, "n": pl.Int64, "first_seen": pl.String}
                  ).write_parquet(out / "schema_drift.parquet")
+    if enriched:
+        eout = root / "enriched" / f"league={season.league}" / f"season={season.key}"
+        eout.mkdir(parents=True, exist_ok=True)
+        for name, df in enriched.items():
+            df.write_parquet(eout / f"{name}.parquet")
     refresh_views(root)
     return out
 
@@ -170,10 +175,10 @@ def write(staged: Staged, root: Path, season: Season) -> Path:
 def refresh_views(root: Path) -> None:
     con = duckdb.connect(str(root / "tbl.duckdb"))
     try:
-        names = sorted({p.stem for p in (root / "staged").glob("*/*/*.parquet")})
-        for name in names:
-            glob = (root / "staged" / "*" / "*" / f"{name}.parquet").as_posix()
-            con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{glob}', "
-                        "hive_partitioning = true, union_by_name = true)")
+        for layer in ("staged", "enriched"):
+            for name in sorted({p.stem for p in (root / layer).glob("*/*/*.parquet")}):
+                glob = (root / layer / "*" / "*" / f"{name}.parquet").as_posix()
+                con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{glob}', "
+                            "hive_partitioning = true, union_by_name = true)")
     finally:
         con.close()

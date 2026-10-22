@@ -51,15 +51,6 @@ def test_drift_reports_unseen_fields():
     assert d.rows() == [{"object": "genius.event", "key": "newField", "n": 1, "first_seen": f"1/a{doc['pbp'][0]['actionNumber']}"}]
 
 
-@pytest.fixture
-def staged(env):
-    env().run()
-    reader = RawReader(env.store, env.manifest, "tbl/2026-27")
-    played = [(r["match_id"], int(r["genius_id"]) if r["genius_id"] else None)
-              for r in env.manifest.matches("tbl/2026-27", played_only=True)]
-    return B.build(reader, S, played)
-
-
 @needs_fixtures
 def test_build_joins_sources(staged):
     t = staged.tables

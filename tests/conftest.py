@@ -46,3 +46,16 @@ def env(tmp_path, clock):
     make.store, make.manifest, make.tbf, make.genius = store, manifest, tbf, genius
     yield make
     manifest.close()
+
+
+@pytest.fixture
+def staged(env):
+    """Fixture season synced offline and built into staged tables (only 345960 has TBF files)."""
+    from tbl_data.build import build
+    from tbl_data.store.reader import RawReader
+
+    env().run()
+    reader = RawReader(env.store, env.manifest, "tbl/2026-27")
+    played = [(r["match_id"], int(r["genius_id"]) if r["genius_id"] else None)
+              for r in env.manifest.matches("tbl/2026-27", played_only=True)]
+    return build(reader, get_season("tbl", "2026-27"), played)

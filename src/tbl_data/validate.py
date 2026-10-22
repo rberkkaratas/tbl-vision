@@ -187,3 +187,102 @@ def career_points(t) -> Check:
 def report(checks: list[Check]) -> pl.DataFrame:
     return pl.DataFrame([{"check": c.name, "ok": c.ok, "blocking": c.blocking, "checked": c.checked,
                           "failures": c.failures.height, "description": c.description} for c in checks])
+
+
+# -- enriched layer -------------------------------------------------------------------
+def run_enriched(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame]) -> list[Check]:
+    return [
+        stint_seconds(s, e),
+        stint_plus_minus(s, e),
+        possession_points(s, e),
+        possession_balance(s, e),
+        possessions_vs_estimate(s, e),
+        ft_trips_vs_box(s, e),
+        shot_zones(e),
+        Check("enrich_issues", "lineup/possession anomalies logged in enrich_issues (informational)",
+              e["events_enriched"].height, e["enrich_issues"].filter(pl.col("source") != "override"), blocking=False),
+    ]
+
+
+def _player_stints(e) -> pl.DataFrame:
+    return (e["stints"].explode("lineup").rename({"lineup": "player_id"})
+            .group_by("match_id", "team_season_id", "player_id")
+            .agg(stint_s=pl.col("seconds").sum(), stint_pm=(pl.col("pts_for") - pl.col("pts_against")).sum()))
+
+
+def stint_seconds(s, e) -> Check:
+    """Minutes rebuilt from substitutions within 5 s of the official box score."""
+    j = s["match_players"].select("match_id", "team_season_id", "player_id", "seconds").join(
+        _player_stints(e), on=["match_id", "team_season_id", "player_id"], how="left").with_columns(
+        pl.col("stint_s").fill_null(0.0), diff=(pl.col("stint_s").fill_null(0.0) - pl.col("seconds")))
+    return Check("stint_seconds", "player seconds from lineups within 5 s of box", j.height,
+                 j.filter(pl.col("diff").abs() > 5))
+
+
+def stint_plus_minus(s, e) -> Check:
+    """+/- rebuilt from lineups vs Genius. Residual differences come from scorer
+    corrections around substitutions that Genius applied but the feed order does not show."""
+    j = s["match_players"].select("match_id", "team_season_id", "player_id", "plus_minus").join(
+        _player_stints(e), on=["match_id", "team_season_id", "player_id"], how="left").with_columns(
+        pl.col("stint_pm").fill_null(0))
+    return Check("stint_plus_minus", "player +/- from lineups = official (informational)", j.height,
+                 j.filter(pl.col("stint_pm") != pl.col("plus_minus")), blocking=False)
+
+
+def possession_points(s, e) -> Check:
+    """Points scored inside possessions add up to each team's final score."""
+    p = e["possessions"]
+    own = p.group_by("match_id", "team_season_id").agg(own=pl.col("pts").sum())
+    # points a team scores during the other team's possession (technical FTs)
+    other = p.join(s["match_teams"].select("match_id", pl.col("team_season_id").alias("scorer")), on="match_id") \
+        .filter(pl.col("scorer") != pl.col("team_season_id")) \
+        .group_by("match_id", "scorer").agg(other=pl.col("pts_against").sum()) \
+        .rename({"scorer": "team_season_id"})
+    j = s["match_teams"].select("match_id", "team_season_id", "pts").join(own, on=["match_id", "team_season_id"], how="left") \
+        .join(other, on=["match_id", "team_season_id"], how="left").with_columns(
+        total=pl.col("own").fill_null(0) + pl.col("other").fill_null(0))
+    return Check("possession_points", "possession points (+ technical FTs on defense) = final score", j.height,
+                 j.filter(pl.col("total") != pl.col("pts")))
+
+
+def possession_balance(s, e) -> Check:
+    """Possessions alternate, so the two teams' counts differ by at most one per period."""
+    p = e["possessions"]
+    n = p.group_by("match_id", "team_season_id").agg(n=pl.len()) \
+        .group_by("match_id").agg(diff=pl.col("n").max() - pl.col("n").min(), teams=pl.len())
+    periods = p.group_by("match_id").agg(periods=pl.col("period_ord").n_unique())
+    j = n.join(periods, on="match_id")
+    return Check("possession_balance", "|home - away possessions| <= periods played", j.height,
+                 j.filter((pl.col("diff") > pl.col("periods")) | (pl.col("teams") != 2)))
+
+
+def possessions_vs_estimate(s, e) -> Check:
+    """Counted possessions vs the box-score estimate FGA - OREB + TOV + 0.44 FTA."""
+    n = e["possessions"].group_by("match_id", "team_season_id").agg(n=pl.len())
+    j = s["match_teams"].join(n, on=["match_id", "team_season_id"]).with_columns(
+        est=pl.col("fga") - pl.col("oreb") + pl.col("tov") + 0.44 * pl.col("fta")).with_columns(
+        diff=(pl.col("n") - pl.col("est")).round(2))
+    return Check("possessions_vs_estimate", "counted possessions within 4 of the box estimate (informational)",
+                 j.height, j.filter(pl.col("diff").abs() > 4).select("match_id", "team_season_id", "n", "est", "diff"),
+                 blocking=False)
+
+
+def ft_trips_vs_box(s, e) -> Check:
+    """Every free throw belongs to exactly one complete trip; trips add up to FTA/FTM."""
+    t = e["ft_trips"].group_by("match_id", "team_season_id").agg(
+        fta_t=pl.col("attempts").sum(), ftm_t=pl.col("made").sum(), incomplete=(~pl.col("complete")).sum())
+    j = s["match_teams"].select("match_id", "team_season_id", "fta", "ftm").join(
+        t, on=["match_id", "team_season_id"], how="left").with_columns(pl.col("fta_t", "ftm_t", "incomplete").fill_null(0))
+    return Check("ft_trips_vs_box", "trip attempts/makes = FTA/FTM, all trips complete", j.height,
+                 j.filter((pl.col("fta_t") != pl.col("fta")) | (pl.col("ftm_t") != pl.col("ftm")) | (pl.col("incomplete") > 0)))
+
+
+def shot_zones(e) -> Check:
+    """The scorer's 2pt/3pt call agrees with the FIBA line at the recorded spot
+    (corner strips 0.90 m from the sidelines up to 2.99 m, arc 6.75 m elsewhere)."""
+    sh = e["shots_enriched"].filter((pl.col("zone") != "heave") & ~pl.col("location_imputed"))
+    corner = (pl.col("x_m") <= 2.99) & ((pl.col("y_m") < 0.9) | (pl.col("y_m") > 14.1))
+    beyond = corner | ((pl.col("x_m") > 2.99) & (pl.col("distance_m") > 6.75))
+    bad = sh.filter((pl.col("shot_type") == "3pt") != beyond)
+    return Check("shot_zones", "2pt/3pt call matches the FIBA 3pt line at the shot location", sh.height,
+                 bad.select("match_id", "action_number", "shot_type", "zone", "distance_m", "x_m", "y_m"))

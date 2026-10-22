@@ -82,11 +82,13 @@ def build(
     data: DataDir = None,
     verbose: bool = False,
 ) -> None:
-    """raw -> staged Parquet + DuckDB views, then cross-source validation."""
+    """raw -> staged -> enriched Parquet + DuckDB views, then validation."""
     import polars as pl
 
     from . import build as B
     from . import validate as V
+    from .config import OVERRIDES_DIR
+    from .enrich import enrich
     from .store.reader import RawReader
 
     _setup_logging(verbose)
@@ -97,13 +99,14 @@ def build(
     played = [(r["match_id"], int(r["genius_id"]) if r["genius_id"] else None) for r in m.matches(scope, played_only=True)]
     staged = B.build(RawReader(RawStore(root / "raw"), m, scope), s, played)
     m.close()
-    out = B.write(staged, root, s)
+    enriched = enrich(staged.tables, OVERRIDES_DIR).tables
+    out = B.write(staged, root, s, enriched)
     checks = V.run_all(staged.tables, pl.DataFrame(staged.drift, schema=["object", "key", "n", "first_seen"]),
-                       staged.unmapped)
+                       staged.unmapped) + V.run_enriched(staged.tables, enriched)
     V.report(checks).write_parquet(out / "validation.parquet")
 
-    typer.echo(f"\nstaged -> {out}")
-    for name, df in staged.tables.items():
+    typer.echo(f"\nstaged + enriched -> {out.parent.parent.parent}")
+    for name, df in {**staged.tables, **enriched}.items():
         typer.echo(f"  {name:<16} {df.height:>7} rows")
     typer.echo("\nvalidation")
     for c in checks:

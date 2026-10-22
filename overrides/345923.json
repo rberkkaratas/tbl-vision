@@ -1,0 +1,9 @@
+{
+  "reorder": [
+    {
+      "actions": [957, 958, 959, 960, 961],
+      "after": 956,
+      "reason": "OT2: substitutions and the and-one free throw were entered at 02:46, but they follow the 02:45 shooting foul (action 955)"
+    }
+  ]
+}

@@ -28,7 +28,7 @@ uv run tbl sync --season 2026-27          # everything due: fixtures, played mat
 uv run tbl sync --max-requests 20         # small trial run
 uv run tbl sync --only genius             # Genius only (needs fixtures already fetched)
 uv run tbl status
-uv run tbl build                          # raw -> staged Parquet + DuckDB views + validation (~3 s)
+uv run tbl build                          # raw -> staged -> enriched Parquet + DuckDB views + validation
 uv run tbl sql "SELECT * FROM matches LIMIT 5"
 ```
 
@@ -94,3 +94,34 @@ national-team career rows without shot splits.
   entered late, so action_number alone can run the clock backwards.
 - Shots: `x`, `y` are 0–100 of the full 28 × 15 m court; teams switch ends at halftime
   and keep the 2nd-half end in OT. 181 tip-ins sit at a fixed spot (6, 50)/(94, 50).
+
+## Enriched tables
+
+`~/data/tbl/enriched/league=tbl/season=2026-27/*.parquet`, same DuckDB file.
+
+| Table | Grain | What it adds |
+|---|---|---|
+| `events_enriched` | event | canonical `seq`, `possession_no`, `offense_team_id`, `home_lineup`/`away_lineup`, `ft_trip_no` |
+| `stints` | team x unchanged five | `lineup`, seconds, points for/against, possessions for/against |
+| `possessions` | possession | offense team, start/end type, duration, points, FGA/FTA/OREB/TOV |
+| `shots_enriched` | shot | metres from the attacked basket, `distance_m`, `zone`, assisted/blocked/fouled, second chance, fast break, possession clock, score margin, both fives |
+| `ft_trips` | free-throw trip | shooter, foul that caused it, type (and-one, shooting, penalty, technical, unsportsmanlike) |
+| `enrich_issues` | issue | lineup/possession anomalies and applied overrides |
+
+Rules (measured on 2026-27):
+- **Order**: game time, then action number. Genius computes +/- in this order (substitutions
+  between free throws count as entered); a FIBA-rule reordering of same-second actions broke
+  +/- for 718 players, so it is not used. Within a second, a linked action follows its target.
+- **Lineups** are replayed from the starters; minutes match the box within 5 s for every
+  player; +/- matches Genius for 1,280/1,299 (rest: scorer corrections, see `enrich_issues`).
+- **Possessions** (an offensive rebound continues a possession) end on a made FG (after the
+  and-one FT if any), made last FT, defensive rebound, turnover or period end. Technical FTs
+  never switch; after unsportsmanlike-type fouls the shooting team keeps the ball. Possession
+  points equal the final score for every team; 0.4% of switches are inferred (logged).
+- **Overrides**: `overrides/{match_id}.json` fixes feed errors by hand, e.g. actions entered
+  with a mistyped clock (`345923`). They are logged in `enrich_issues`.
+- **Shots**: each team's basket per half comes from the majority of its shots; the far end is
+  rotated 180°. Zones: rim (≤ 1.25 m), paint, midrange, corner 3 (≤ 2.99 m from the
+  baseline, 0.90 m strips), above-the-break 3, heave (beyond half court). The 2pt/3pt call
+  matches the FIBA line for every located shot. Tip-ins at Genius' default spot are
+  `location_imputed`.
