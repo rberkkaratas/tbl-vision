@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# third-party match data never goes into the repo (no redistribution)
+data/
+tests/fixtures/
+# SeleniumBase runtime files
+downloaded_files/

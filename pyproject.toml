@@ -1,0 +1,32 @@
+[project]
+name = "tbl-data"
+version = "0.1.0"
+description = "TBL (Turkish Basketball League) data pipeline: TBF + Genius LiveStats"
+authors = [
+    { name = "R.Berk Karatas", email = "rberkk@protonmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "seleniumbase==4.56.3",
+    "stamina>=26.1.0",
+    "structlog>=26.1.0",
+    "typer>=0.27.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "respx>=0.23.1",
+]
+
+[project.scripts]
+tbl = "tbl_data.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:randomly"
