@@ -17,7 +17,7 @@ BOX_PLAYER = {
     "sFreeThrowsMade": "ftm", "sFreeThrowsAttempted": "fta",
     "sReboundsOffensive": "oreb", "sReboundsDefensive": "dreb", "sReboundsTotal": "reb",
     "sAssists": "ast", "sTurnovers": "tov", "sSteals": "stl", "sBlocks": "blk",
-    "sBlocksReceived": "blk_against", "sFoulsPersonal": "pf", "sFoulsOn": "fouls_drawn",
+    "sBlocksReceived": "fga_blocked", "sFoulsPersonal": "pf", "sFoulsOn": "fouls_drawn",
     "sPlusMinusPoints": "plus_minus", "eff_1": "eff",
     "sPointsSecondChance": "pts_second_chance", "sPointsFastBreak": "pts_fast_break",
     "sPointsInThePaint": "pts_paint",
@@ -25,7 +25,7 @@ BOX_PLAYER = {
 # Team totals include team rebounds/turnovers (not credited to a player).
 BOX_TEAM = {"tot_" + k: v for k, v in BOX_PLAYER.items() if k != "sPlusMinusPoints"} | {
     "tot_sReboundsTeamOffensive": "team_reb_off", "tot_sReboundsTeamDefensive": "team_reb_def",
-    "tot_sTurnoversTeam": "team_tov", "tot_sFoulsTeam": "team_fouls",
+    "tot_sTurnoversTeam": "team_tov", "tot_sFoulsTeam": "coach_bench_fouls", "tot_sFoulsTotal": "fouls_total",
     "tot_sPointsFromTurnovers": "pts_off_tov", "tot_sBenchPoints": "pts_bench",
     "tot_sBiggestLead": "biggest_lead", "tot_sBiggestScoringRun": "biggest_run",
     "tot_sLeadChanges": "lead_changes", "tot_sTimesScoresLevel": "times_tied",

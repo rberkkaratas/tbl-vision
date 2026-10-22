@@ -27,7 +27,7 @@ def Opt():
 # Box score columns shared by Genius and TBF player rows (see parse/*: BOX_* maps).
 BOX_STATS = (
     "seconds", "pts", "fgm", "fga", "fg2m", "fg2a", "fg3m", "fg3a", "ftm", "fta",
-    "oreb", "dreb", "reb", "ast", "tov", "stl", "blk", "blk_against", "pf", "fouls_drawn",
+    "oreb", "dreb", "reb", "ast", "tov", "stl", "blk", "fga_blocked", "pf", "fouls_drawn",
     "plus_minus", "eff",
 )
 
@@ -50,11 +50,11 @@ class _Box(pa.DataFrameModel):
     tov: Int = Count()
     stl: Int = Count()
     blk: Int = Count()
-    blk_against: Int = Count()
-    pf: Int = Count()
+    fga_blocked: Int = Count()
+    pf: Int = Count()  # all player fouls incl. technical/unsportsmanlike/disqualifying (FIBA 5-foul count)
     fouls_drawn: Int = Count()
     plus_minus: Int = Opt()
-    eff: Int
+    eff: Int  # FIBA efficiency; team rows include team rebounds and subtract team turnovers
 
 
 class Matches(pa.DataFrameModel):
@@ -127,7 +127,8 @@ class MatchTeams(_Box):
     team_reb_off: Int = Count()
     team_reb_def: Int = Count()
     team_tov: Int = Count()
-    team_fouls: Int = Count()
+    coach_bench_fouls: Int = Count()  # coach/bench technicals + coach disqualifying; not in pf
+    fouls_total: Int = Count()  # pf + coach_bench_fouls
     pts_off_tov: Int = Count()
     pts_second_chance: Int = Count()
     pts_fast_break: Int = Count()
@@ -136,7 +137,7 @@ class MatchTeams(_Box):
     biggest_lead: Int = Count()
     biggest_run: Int = Count()
     lead_changes: Int = Count()
-    times_tied: Int = Count()
+    times_tied: Int = Count()  # raw Genius counter; 1-2 above a recount in some games
     time_leading_s: pl.Float64 = Count()
 
     class Config:
@@ -244,10 +245,11 @@ class PlayerCareer(pa.DataFrameModel):
     stl: Int = Count()
     tov: Int = Count()
     blk: Int = Count()
-    blk_against: Int = Count()
+    fga_blocked: Int = Count()
     pf: Int = Count()
     fouls_drawn: Int = Count()
-    eff: Int
+    eff: Int  # FIBA efficiency (TBF playerEfficiency)
+    shooting_missing: pl.Boolean  # legacy points-only row: no shot splits, seconds is a placeholder
 
     class Config:
         strict = True

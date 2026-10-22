@@ -76,3 +76,21 @@ mapping, points add up, per-period points sum to the final, shots = FGA, TBF gam
 is a subset of Genius pbp, no unseen source fields. Informational notes (2026-27): one
 TBF minutes misattribution (345930), one incomplete TBF shot chart (345937), and old or
 national-team career rows without shot splits.
+
+### Column conventions (verified against the FIBA Statisticians' Manual 2024)
+
+- `eff` = FIBA efficiency (Genius `eff_1`, TBF `efficiency`). Team `eff` includes team
+  rebounds and subtracts team turnovers. PIR / Game Score are not stored; derive them
+  (Genius `eff_5` double-subtracts technicals, `eff_2`/`eff_4` are not standard metrics).
+- `pf` = every foul by the player incl. technical/unsportsmanlike/disqualifying. Team
+  `coach_bench_fouls` = coach/bench technicals; `fouls_total` = `pf` + `coach_bench_fouls`.
+- `fga_blocked` = player's own shots that were blocked. `fouls_drawn` = fouls received.
+- Team `oreb`/`dreb`/`reb`/`tov` include team rebounds/turnovers (`team_reb_*`, `team_tov`).
+- In `events`, rebounds with `sub_type = 'offensivedeadball'` are not rebounds (ball not
+  live after a missed non-final FT); team rebounds/turnovers have `player_id` null.
+- `pts_paint` = made 2pt shots in the restricted area (no FTs); `times_tied` is the raw
+  Genius counter (can be 1–2 above a recount).
+- Sort play-by-play by `(period_ord, elapsed_s, action_number)`: ~0.3% of actions are
+  entered late, so action_number alone can run the clock backwards.
+- Shots: `x`, `y` are 0–100 of the full 28 × 15 m court; teams switch ends at halftime
+  and keep the 2nd-half end in OT. 181 tip-ins sit at a fixed spot (6, 50)/(94, 50).

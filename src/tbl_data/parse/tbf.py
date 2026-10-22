@@ -25,7 +25,7 @@ BOX_PLAYER = {
     "freeThrows": "ftm", "freeThrowAttempts": "fta",
     "offensiveRebounds": "oreb", "defensiveRebounds": "dreb", "totalRebounds": "reb",
     "assists": "ast", "turnovers": "tov", "steals": "stl", "blocks": "blk",
-    "blocksReceived": "blk_against", "fouls": "pf", "rivalFoul": "fouls_drawn",
+    "blocksReceived": "fga_blocked", "fouls": "pf", "rivalFoul": "fouls_drawn",
     "efficiency": "eff",
 }
 BOX_LISTS = {"homeTopFive": True, "homeBenchPlayers": True, "awayTopFive": False, "awayBenchPlayers": False}
@@ -37,7 +37,7 @@ CAREER = {
     "freeThowsMade": "ftm", "freeThowsAttempted": "fta",
     "offensiveRebounds": "oreb", "defensiveRebounds": "dreb", "rebounds": "reb",
     "assists": "ast", "steals": "stl", "tournovers": "tov", "blocks": "blk",
-    "yenilenBlok": "blk_against", "fauls": "pf", "yapilanFaul": "fouls_drawn",
+    "yenilenBlok": "fga_blocked", "fauls": "pf", "yapilanFaul": "fouls_drawn",
     "playerEfficiency": "eff",
 }
 
@@ -176,5 +176,6 @@ def career_rows(doc: dict, player_id: int, drift: Drift) -> list[dict]:
              "registered_at": c.get("processDate"),
              "seconds": minutes_to_s(c.get("formattedTotalSeconds"))}
         r |= {col: to_int(c.get(k)) or 0 for k, col in CAREER.items()}
+        r["shooting_missing"] = r["pts"] > 0 and r["fg2a"] + r["fg3a"] + r["fta"] == 0
         rows.append(r)
     return rows

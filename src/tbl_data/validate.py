@@ -32,6 +32,7 @@ def run_all(t: dict[str, pl.DataFrame], drift: pl.DataFrame, unmapped: list[dict
         period_scores(t),
         shots_vs_fga(t),
         tbf_shots_vs_genius(t),
+        events_vs_box(t),
         tbf_events_subset(t),
         career_points(t),
         Check("schema_drift", "no unseen source fields", drift.height, drift),
@@ -137,6 +138,33 @@ def tbf_shots_vs_genius(t) -> Check:
                  j.filter(pl.col("diff") != 0).sort("diff", descending=True), blocking=False)
 
 
+def events_vs_box(t) -> Check:
+    """Each player's box score recounted from play-by-play events.
+
+    'offensivedeadball' rebounds (after a missed non-final free throw, ball not live) are
+    not rebounds in FIBA stats and are excluded; pf counts every foul event incl. technicals.
+    """
+    e, a, s = t["events"].filter(pl.col("player_id").is_not_null()), pl.col("action_type"), pl.col("sub_type")
+    made = pl.col("success")
+    counts = e.group_by("match_id", "player_id").agg(
+        fg2m=((a == "2pt") & made).sum(), fg2a=(a == "2pt").sum(),
+        fg3m=((a == "3pt") & made).sum(), fg3a=(a == "3pt").sum(),
+        ftm=((a == "freethrow") & made).sum(), fta=(a == "freethrow").sum(),
+        oreb=((a == "rebound") & (s == "offensive")).sum(), dreb=((a == "rebound") & (s == "defensive")).sum(),
+        ast=(a == "assist").sum(), stl=(a == "steal").sum(), blk=(a == "block").sum(), tov=(a == "turnover").sum(),
+        pf=(a == "foul").sum(), fouls_drawn=(a == "foulon").sum(),
+    )
+    cols = [c for c in counts.columns if c not in ("match_id", "player_id")]
+    j = t["match_players"].select("match_id", "player_id", *cols).join(
+        counts, on=["match_id", "player_id"], how="left", suffix="_pbp").with_columns(
+        pl.col(f"{c}_pbp").fill_null(0) for c in cols)
+    diffs = [j.filter(pl.col(c) != pl.col(f"{c}_pbp")).select(
+        "match_id", "player_id", pl.lit(c).alias("stat"), pl.col(c).cast(pl.Int64).alias("box"),
+        pl.col(f"{c}_pbp").cast(pl.Int64).alias("pbp")) for c in cols]
+    return Check("events_vs_box", f"{len(cols)} box stats per player recounted from pbp", j.height * len(cols),
+                 pl.concat(diffs))
+
+
 def tbf_events_subset(t) -> Check:
     """Every TBF game-flow action number exists in the Genius play-by-play."""
     j = t["tbf_events"].join(t["events"].select("match_id", "action_number"), on=["match_id", "action_number"], how="anti")
@@ -147,10 +175,10 @@ def tbf_events_subset(t) -> Check:
 def career_points(t) -> Check:
     """TBF career rows: pts = 2*fg2m + 3*fg3m + ftm (proves fieldGoalsMade = 2P made).
 
-    Known exceptions: national-team ('UA-' seasons) rows carry points only, and a few
-    pre-2017 club rows are incomplete at the source.
+    Legacy points-only rows (shooting_missing) are skipped; a few pre-2017 club rows
+    still differ by a few points at the source.
     """
-    c = t["player_career"]
+    c = t["player_career"].filter(~pl.col("shooting_missing"))
     bad = c.filter(pl.col("pts") != 2 * pl.col("fg2m") + 3 * pl.col("fg3m") + pl.col("ftm"))
     return Check("career_points", "career pts = 2*2PM + 3*3PM + FTM (informational)", c.height,
                  bad.select("player_id", "career_season", "competition", "pts", "fg2m", "fg3m", "ftm"), blocking=False)
