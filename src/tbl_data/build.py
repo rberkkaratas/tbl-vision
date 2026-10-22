@@ -87,7 +87,9 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
 
         for t in G.team_rows(g, match_id, drift):
             tno = t.pop("tno")
-            rows["match_teams"].append(t | {"team_season_id": team_of[tno], "is_home": tno == 1})
+            # TBF's coach is the registered name; Genius' is typed per game (case/spelling vary)
+            coach = hdr["home_coach" if tno == 1 else "away_coach"] or t["coach"]
+            rows["match_teams"].append(t | {"team_season_id": team_of[tno], "is_home": tno == 1, "coach": coach})
 
         events = G.event_rows(g, match_id, drift)
         for p in G.period_rows(events, G.periods(g)[0]):
