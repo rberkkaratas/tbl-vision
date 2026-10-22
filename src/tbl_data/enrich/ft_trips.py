@@ -77,3 +77,32 @@ def _find_foul(events: list[dict], i: int, ft: dict, n: int, used: set[int]) -> 
             continue  # a player foul awards shots to the other team
         return f
     return None
+
+
+# a live-ball action: once one happens, a later free throw can no longer be for this shot
+_LIVE = {"2pt", "3pt", "rebound", "turnover", "jumpball", "period"}
+DEAD_BALL_LAG_S = 5  # longest seen between a basket and its late-entered and-one foul: 4 s
+
+
+def trip_after_shot(events: list[dict], i: int, trips: list[dict], trip_of: dict[int, int]) -> dict | None:
+    """The shooter's own free-throw trip in the dead ball that follows shot events[i], if any.
+
+    Matched by order, not by exact clock: the foul and free throws are sometimes entered
+    up to a few seconds later, after substitutions or a timeout. Technical free throws in
+    between are skipped; any other trip, or a live-ball action, ends the dead ball.
+    """
+    shot = events[i]
+    by_no = {t["trip_no"]: t for t in trips}
+    for e in events[i + 1:]:
+        if e["action_type"] in _LIVE or e["period_ord"] != shot["period_ord"] \
+                or e["elapsed_s"] - shot["elapsed_s"] > DEAD_BALL_LAG_S:
+            return None
+        if e["action_type"] == "freethrow":
+            t = by_no.get(trip_of.get(e["action_number"]))
+            if t is None or t["trip_type"] == "technical":
+                continue
+            mine = t["shooter_id"] == shot["player_id"] or (
+                # a 1-FT shooting foul only follows a basket: the feed credited another player
+                t["trip_type"] == "and_one" and t["team_season_id"] == shot["team_season_id"])
+            return t if mine else None
+    return None

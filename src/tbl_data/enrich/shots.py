@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from collections import Counter
 
+from .ft_trips import trip_after_shot
+
 COURT_X, COURT_Y = 28.0, 15.0
 RIM_X, RIM_Y = 1.575, 7.5
 CORNER_X = 2.99  # where the corner 3pt straight line meets the arc
@@ -59,10 +61,24 @@ def locate(s: dict, high_end: bool) -> dict:
     }
 
 
-def enrich_shots(shots: list[dict], events: list[dict], trips: list[dict], possessions: list[dict]) -> list[dict]:
+def enrich_shots(shots: list[dict], events: list[dict], trips: list[dict], trip_of: dict[int, int],
+                 possessions: list[dict]) -> list[dict]:
     """shots + events of one match (events in canonical order, enriched) -> shot rows."""
     ends = attack_ends(shots)
     by_an = {e["action_number"]: e for e in events}
+    idx = {e["action_number"]: i for i, e in enumerate(events)}
+    # score before each event, replayed in our order (Genius' stamps follow its own clock
+    # order, which is off where we reordered)
+    before: dict[int, tuple[int, int]] = {}
+    home = away = 0
+    for e in events:
+        before[e["action_number"]] = (home, away)
+        if e["action_type"] in ("2pt", "3pt", "freethrow") and e["success"] and e.get("team_season_id") is not None:
+            pts = {"2pt": 2, "3pt": 3, "freethrow": 1}[e["action_type"]]
+            if e["is_home"]:
+                home += pts
+            else:
+                away += pts
     linked: dict[int, dict[str, dict]] = {}  # shot action -> {"assist": e, "block": e}
     for e in events:
         if e["action_type"] in ("assist", "block") and e.get("previous_action") is not None:
@@ -82,15 +98,14 @@ def enrich_shots(shots: list[dict], events: list[dict], trips: list[dict], posse
             "blocked": b is not None, "block_player_id": b["player_id"] if b else None,
             "second_chance": "2ndchance" in q, "fast_break": "fastbreak" in q,
             "from_turnover": "fromturnover" in q, "in_paint": "pointsinthepaint" in q,
-            "fouled": _fouled(s, e, trips),
+            "fouled": _fouled(events, idx.get(s["action_number"]), trips, trip_of),
         }
         p = poss.get(e["possession_no"]) if e else None
         r["possession_no"] = p["possession_no"] if p else None
         r["possession_elapsed_s"] = round(e["elapsed_s"] - p["start_s"], 2) if p else None
         if e:
-            own, opp = (e["score_home"], e["score_away"]) if s["is_home"] else (e["score_away"], e["score_home"])
-            pts = (3 if s["shot_type"] == "3pt" else 2) if s["made"] else 0
-            r["margin_before"] = own - pts - opp  # running score includes this shot when made
+            h, a = before[s["action_number"]]
+            r["margin_before"] = h - a if s["is_home"] else a - h
             r["offense_lineup"] = e["home_lineup"] if s["is_home"] else e["away_lineup"]
             r["defense_lineup"] = e["away_lineup"] if s["is_home"] else e["home_lineup"]
         else:
@@ -99,13 +114,9 @@ def enrich_shots(shots: list[dict], events: list[dict], trips: list[dict], posse
     return out
 
 
-def _fouled(s: dict, e: dict | None, trips: list[dict]) -> bool:
-    """A shooting-foul trip for this shooter right after the shot (and-one or missed + FTs)."""
-    if e is None:
+def _fouled(events: list[dict], i: int | None, trips: list[dict], trip_of: dict[int, int]) -> bool:
+    """The shooter got a shooting-foul trip in the dead ball right after the shot."""
+    if i is None:
         return False
-    for t in trips:
-        if t["trip_type"] in ("and_one", "shooting_2pt", "shooting_3pt") and t["shooter_id"] == s["player_id"] \
-                and t["period_ord"] == s["period_ord"] and 0 <= t["elapsed_s"] - e["elapsed_s"] <= 1 \
-                and t["first_seq"] > e["seq"]:
-            return True
-    return False
+    t = trip_after_shot(events, i, trips, trip_of)
+    return t is not None and t["trip_type"] in ("and_one", "shooting_2pt", "shooting_3pt", "shooting")

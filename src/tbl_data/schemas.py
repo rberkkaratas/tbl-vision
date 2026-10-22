@@ -440,7 +440,7 @@ class FtTrips(pa.DataFrameModel):
 
 class EnrichIssues(pa.DataFrameModel):
     match_id: Int
-    source: str = pa.Field(isin=["lineup", "possession", "override"])
+    source: str = pa.Field(isin=["order", "lineup", "possession", "override"])
     issue: str
     action_number: Int = Opt()
     seq: Int = Opt()

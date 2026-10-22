@@ -194,12 +194,16 @@ def run_enriched(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame]) -> list
     return [
         stint_seconds(s, e),
         stint_plus_minus(s, e),
+        stint_possessions(e),
         possession_points(s, e),
+        possession_attribution(e),
         possession_balance(s, e),
         possessions_vs_estimate(s, e),
         ft_trips_vs_box(s, e),
+        ft_trip_fouls(e),
+        attack_ends(e),
         shot_zones(e),
-        Check("enrich_issues", "lineup/possession anomalies logged in enrich_issues (informational)",
+        Check("enrich_issues", "order/lineup/possession anomalies logged in enrich_issues (informational)",
               e["events_enriched"].height, e["enrich_issues"].filter(pl.col("source") != "override"), blocking=False),
     ]
 
@@ -220,8 +224,8 @@ def stint_seconds(s, e) -> Check:
 
 
 def stint_plus_minus(s, e) -> Check:
-    """+/- rebuilt from lineups vs Genius. Residual differences come from scorer
-    corrections around substitutions that Genius applied but the feed order does not show."""
+    """+/- rebuilt from lineups vs Genius. Known residual: 345923, where our override fixes
+    a mistyped clock that Genius' own +/- still follows (4 players)."""
     j = s["match_players"].select("match_id", "team_season_id", "player_id", "plus_minus").join(
         _player_stints(e), on=["match_id", "team_season_id", "player_id"], how="left").with_columns(
         pl.col("stint_pm").fill_null(0))
@@ -229,8 +233,20 @@ def stint_plus_minus(s, e) -> Check:
                  j.filter(pl.col("stint_pm") != pl.col("plus_minus")), blocking=False)
 
 
+def stint_possessions(e) -> Check:
+    """Every possession is credited to exactly one stint of each team."""
+    p = e["possessions"]
+    n = p.group_by("match_id", "team_season_id").agg(n=pl.len())
+    tot = p.group_by("match_id").agg(total=pl.len())
+    st = e["stints"].group_by("match_id", "team_season_id").agg(pl.col("poss_for").sum(), pl.col("poss_against").sum())
+    j = st.join(n, on=["match_id", "team_season_id"], how="left").join(tot, on="match_id").with_columns(pl.col("n").fill_null(0))
+    return Check("stint_possessions", "stint poss_for/against add up to the team's/opponent's possessions", j.height,
+                 j.filter((pl.col("poss_for") != pl.col("n")) | (pl.col("poss_against") != pl.col("total") - pl.col("n"))))
+
+
 def possession_points(s, e) -> Check:
-    """Points scored inside possessions add up to each team's final score."""
+    """Possession points add up to each team's final score, and the only points scored by
+    the team without the ball are technical free throws."""
     p = e["possessions"]
     own = p.group_by("match_id", "team_season_id").agg(own=pl.col("pts").sum())
     # points a team scores during the other team's possession (technical FTs)
@@ -241,19 +257,46 @@ def possession_points(s, e) -> Check:
     j = s["match_teams"].select("match_id", "team_season_id", "pts").join(own, on=["match_id", "team_season_id"], how="left") \
         .join(other, on=["match_id", "team_season_id"], how="left").with_columns(
         total=pl.col("own").fill_null(0) + pl.col("other").fill_null(0))
-    return Check("possession_points", "possession points (+ technical FTs on defense) = final score", j.height,
-                 j.filter(pl.col("total") != pl.col("pts")))
+    ev = e["events_enriched"].filter(pl.col("action_type").is_in(["2pt", "3pt", "freethrow"]) & pl.col("success")
+                                     & (pl.col("team_season_id") != pl.col("offense_team_id")))
+    tech = e["ft_trips"].filter(pl.col("trip_type") == "technical").select("match_id", ft_trip_no="trip_no", tech=pl.lit(True))
+    bad_ev = ev.join(tech, on=["match_id", "ft_trip_no"], how="left").filter(pl.col("tech").is_null()) \
+        .select("match_id", "action_number", "action_type", "team_season_id", "offense_team_id")
+    bad = pl.concat([j.filter(pl.col("total") != pl.col("pts")).select("match_id", "team_season_id")
+                     .with_columns(action_number=pl.lit(None, pl.Int32), problem=pl.lit("final score")),
+                     bad_ev.select("match_id", "team_season_id", "action_number", problem=pl.lit("points on defense"))])
+    return Check("possession_points", "possession points = final score; defense scores only technical FTs",
+                 j.height + ev.height, bad)
+
+
+DESCRIBES = ["assist", "steal", "block", "foulon"]
+
+
+def possession_attribution(e) -> Check:
+    """Offensive actions are by the team with the ball, defensive rebounds by the other one,
+    and an assist/steal/block/foulon sits in the possession of the action it describes."""
+    ev = e["events_enriched"]
+    a, team, off = pl.col("action_type"), pl.col("team_season_id"), pl.col("offense_team_id")
+    wrong = ev.filter(team.is_not_null() & (
+        (a.is_in(["2pt", "3pt", "turnover"]) & (team != off))
+        | ((a == "rebound") & (pl.col("sub_type") == "offensive") & (team != off))
+        | ((a == "rebound") & (pl.col("sub_type") == "defensive") & (team == off))))
+    tgt = ev.select("match_id", previous_action="action_number", tgt_poss="possession_no", tgt_period="period_ord")
+    d = ev.filter(a.is_in(DESCRIBES) & pl.col("previous_action").is_not_null()).join(
+        tgt, on=["match_id", "previous_action"], how="inner").filter(pl.col("period_ord") == pl.col("tgt_period"))
+    bad = pl.concat([wrong.select("match_id", "action_number", "action_type"),
+                     d.filter(pl.col("possession_no") != pl.col("tgt_poss")).select("match_id", "action_number", "action_type")])
+    return Check("possession_attribution", "events agree with who has the ball; describing actions share their target's possession",
+                 ev.height, bad)
 
 
 def possession_balance(s, e) -> Check:
-    """Possessions alternate, so the two teams' counts differ by at most one per period."""
-    p = e["possessions"]
-    n = p.group_by("match_id", "team_season_id").agg(n=pl.len()) \
-        .group_by("match_id").agg(diff=pl.col("n").max() - pl.col("n").min(), teams=pl.len())
-    periods = p.group_by("match_id").agg(periods=pl.col("period_ord").n_unique())
-    j = n.join(periods, on="match_id")
-    return Check("possession_balance", "|home - away possessions| <= periods played", j.height,
-                 j.filter((pl.col("diff") > pl.col("periods")) | (pl.col("teams") != 2)))
+    """Possessions alternate, so in each period the two teams' counts differ by at most one."""
+    p = e["possessions"].join(s["match_teams"].select("match_id", "team_season_id", "is_home"),
+                              on=["match_id", "team_season_id"])
+    j = p.group_by("match_id", "period_ord").agg(home=pl.col("is_home").sum(), away=(~pl.col("is_home")).sum())
+    return Check("possession_balance", "|home - away possessions| <= 1 in every period", j.height,
+                 j.filter((pl.col("home").cast(pl.Int64) - pl.col("away").cast(pl.Int64)).abs() > 1))
 
 
 def possessions_vs_estimate(s, e) -> Check:
@@ -275,6 +318,27 @@ def ft_trips_vs_box(s, e) -> Check:
         t, on=["match_id", "team_season_id"], how="left").with_columns(pl.col("fta_t", "ftm_t", "incomplete").fill_null(0))
     return Check("ft_trips_vs_box", "trip attempts/makes = FTA/FTM, all trips complete", j.height,
                  j.filter((pl.col("fta_t") != pl.col("fta")) | (pl.col("ftm_t") != pl.col("ftm")) | (pl.col("incomplete") > 0)))
+
+
+def ft_trip_fouls(e) -> Check:
+    """Trips whose causing foul could not be found (a feed error, e.g. foul on the wrong team)."""
+    t = e["ft_trips"]
+    return Check("ft_trip_fouls", "every FT trip linked to the foul that awarded it (informational)", t.height,
+                 t.filter(pl.col("foul_action").is_null()).select("match_id", "trip_no", "team_season_id", "shooter_id",
+                                                                   "n_awarded", "trip_type"), blocking=False)
+
+
+def attack_ends(e) -> Check:
+    """In every half the two teams shoot at opposite baskets and switch at half-time
+    (majority of shots per team and half, in raw feed coordinates)."""
+    sh = e["shots_enriched"].filter(~pl.col("location_imputed")).with_columns(
+        half=pl.when(pl.col("period_ord") <= 2).then(1).otherwise(2), high=pl.col("x") > 50)
+    ends = sh.group_by("match_id", "team_season_id", "half").agg(high=pl.col("high").mean() > 0.5)
+    by_half = ends.group_by("match_id", "half").agg(n=pl.len(), opposite=pl.col("high").n_unique() == 2)
+    by_team = ends.group_by("match_id", "team_season_id").agg(n=pl.len(), switched=pl.col("high").n_unique() == 2)
+    bad = pl.concat([by_half.filter((pl.col("n") == 2) & ~pl.col("opposite")).select("match_id", what=pl.lit("same end")),
+                     by_team.filter((pl.col("n") == 2) & ~pl.col("switched")).select("match_id", what=pl.lit("no switch"))])
+    return Check("attack_ends", "teams attack opposite ends and switch at half-time", ends.height, bad)
 
 
 def shot_zones(e) -> Check:

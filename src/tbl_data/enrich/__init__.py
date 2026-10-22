@@ -38,7 +38,8 @@ def enrich(staged: dict[str, pl.DataFrame], overrides_dir: Path | None = None) -
         players = mp.filter((pl.col("match_id") == match_id) & pl.col("starter"))
         starters = {t: set(players.filter(pl.col("team_season_id") == t)["player_id"]) for t in (home, away)}
 
-        events, _ = order_events(g.to_dicts())
+        events, relinked = order_events(g.to_dicts())
+        rows["enrich_issues"] += [_issue(match_id, r, "order", "reordered", note=r["note"]) for r in relinked]
         overridden: set[int] = set()
         ov_path = overrides_dir / f"{match_id}.json" if overrides_dir else None
         if ov_path and ov_path.exists():
@@ -52,7 +53,7 @@ def enrich(staged: dict[str, pl.DataFrame], overrides_dir: Path | None = None) -
         trips, trip_of = build_trips(match_id, events)
         poss, anomalies = build_possessions(match_id, events, trips, trip_of, (home, away))
         shots = enrich_shots(shots_by_match[(match_id,)].to_dicts() if (match_id,) in shots_by_match else [],
-                             events, trips, poss)
+                             events, trips, trip_of, poss)
 
         for e in events:
             e["ft_trip_no"] = trip_of.get(e["action_number"])
@@ -60,7 +61,7 @@ def enrich(staged: dict[str, pl.DataFrame], overrides_dir: Path | None = None) -
         seq_poss = {e["seq"]: e["possession_no"] for e in events}
         for t in trips:
             t["possession_no"] = seq_poss.get(t["first_seq"])
-        _stint_possessions(lu.stints, poss)
+        _stint_possessions(lu.stints, poss, events, home)
 
         rows["events_enriched"] += events
         rows["stints"] += lu.stints
@@ -75,8 +76,17 @@ def enrich(staged: dict[str, pl.DataFrame], overrides_dir: Path | None = None) -
     return Enriched(tables)
 
 
-def _stint_possessions(stints: list[dict], poss: list[dict]) -> None:
-    """Possessions played by each stint, by the five on court when the possession began."""
+DEAD_BALL = {"substitution", "timeout", "period", "game"}
+
+
+def _stint_possessions(stints: list[dict], poss: list[dict], events: list[dict], home: int) -> None:
+    """Possessions played by each stint: the five on court at the possession's first live
+    action. Its first event is often the dead ball in which substitutions are made, and
+    the five that just went off must not get it."""
+    live: dict[int, dict] = {}
+    for e in events:
+        if e["possession_no"] is not None and e["action_type"] not in DEAD_BALL:
+            live.setdefault(e["possession_no"], e)
     by_team: dict[int, list[dict]] = {}
     for s in stints:
         s["poss_for"] = s["poss_against"] = 0
@@ -84,12 +94,15 @@ def _stint_possessions(stints: list[dict], poss: list[dict]) -> None:
     for team, ss in by_team.items():
         ss.sort(key=lambda s: s["start_seq"])
         for p in poss:
-            st = None
-            for s in ss:  # last stint that started at or before the possession
-                if s["start_seq"] <= p["start_seq"]:
-                    st = s
-                else:
-                    break
+            e = live.get(p["possession_no"])
+            at = e["seq"] if e else p["start_seq"]
+            five = (e["home_lineup"] if team == home else e["away_lineup"]) if e else None
+            in_period = [s for s in ss if s["period_ord"] == p["period_ord"]]
+            # the stint of that five; a stint opens when its substitution window closes, which
+            # can be a few same-second actions after the five is already on court
+            same = [s for s in in_period if s["lineup"] == five]
+            st = next((s for s in reversed(same) if s["start_seq"] <= at), same[0] if same else None) or \
+                next((s for s in reversed(in_period) if s["start_seq"] <= at), in_period[0] if in_period else None)
             if st is not None:
                 st["poss_for" if p["team_season_id"] == team else "poss_against"] += 1
 

@@ -2,23 +2,28 @@
 continues the same possession).
 
 A possession of team T ends after:
-  made field goal (unless an and-one free throw follows: then after that trip)
+  made field goal (unless the shooter's 1-FT trip follows in the same dead ball: and-one)
   made last free throw of a trip           (missed last FT: the rebound decides)
   defensive rebound by the other team      turnover by T          end of period
 Technical free throws never change possession. After unsportsmanlike-type fouls the
-fouled team shoots and keeps the ball, so their trip does not end it.
+fouled team shoots and keeps the ball, so their trip does not end it (nor does another
+trip shot in the same dead ball).
 
 Who has the ball is otherwise inferred from offensive actions (shots, non-technical
 free throws, turnovers, offensive rebounds). If the other team makes one without an end
-event (jump ball, held ball, or a gap in the feed) the possession is switched; outside
-jump-ball situations that is logged as an anomaly.
+event, the possession is switched: after a held ball that is the alternating arrow,
+otherwise a gap in the feed, logged as an anomaly.
+
+Every event belongs to the possession in which it happened; an action that describes
+another one (assist, steal, block, foulon) belongs to the possession of its target.
 """
 
 from __future__ import annotations
 
-from .ft_trips import BALL_RETAINED
+from .ft_trips import trip_after_shot
 
 POINTS = {"2pt": 2, "3pt": 3, "freethrow": 1}
+DESCRIBES = {"assist", "steal", "block", "foulon"}
 
 
 def _offensive(e: dict, trip: dict | None) -> bool:
@@ -69,15 +74,16 @@ def build_possessions(match_id: int, events: list[dict], trips: list[dict], trip
                 cur["team_season_id"] = team
             elif cur["team_season_id"] != team:
                 retained = trip is not None and trip["trip_type"] == "unsportsmanlike"
-                kind = "jumpball" if flexible else ("unsportsmanlike_foul" if retained else "inferred")
-                if cur["offensive_actions"] == 0 and (flexible or retained):
-                    cur["team_season_id"] = team  # our guess of who got the ball was wrong
-                    if cur["start_type"] != "period_start":
-                        cur["start_type"] = kind
+                if retained and not flexible and cur["offensive_actions"] == 0:
+                    # fouled before the other team got going (e.g. right after a basket): their ball
+                    cur["team_season_id"] = team
+                    cur["start_type"] = "unsportsmanlike_foul"
                 else:
+                    kind = "jumpball" if flexible else ("unsportsmanlike_foul" if retained else "inferred")
                     if kind == "inferred":
                         anomalies.append({"match_id": match_id, "action_number": e["action_number"], "seq": e["seq"],
-                                          "team_season_id": team, "issue": "possession_switch_without_end",
+                                          "team_season_id": team, "player_id": e.get("player_id"),
+                                          "issue": "possession_switch_without_end",
                                           "period_label": e["period_label"], "clock": e["clock"]})
                     end(kind, team, kind, e["period_ord"])
             cur["offensive_actions"] += 1
@@ -96,10 +102,12 @@ def build_possessions(match_id: int, events: list[dict], trips: list[dict], trip
         if off is None or team is None:
             continue
         if a in ("2pt", "3pt") and e["success"] and team == off:
-            if not _and_one_follows(events, i, trips, team):
+            t = trip_after_shot(events, i, trips, trip_of)
+            if not (t and t["n_awarded"] == 1 and t["trip_type"] in ("and_one", "unsportsmanlike")):
                 end("made_fg", other[off], "after_made_fg", e["period_ord"])
         elif a == "freethrow" and team == off and trip and e["seq"] == trip["last_seq"]:
-            if trip["trip_type"] not in ("technical", "unsportsmanlike") and e["success"]:
+            if trip["trip_type"] not in ("technical", "unsportsmanlike") and e["success"] \
+                    and not _ball_retained_same_dead_ball(trip, trips):
                 end("made_ft", other[off], "after_made_ft", e["period_ord"])
         elif a == "rebound" and e["sub_type"] == "defensive" and team != off:
             end("defensive_rebound", team, "after_defensive_rebound", e["period_ord"])
@@ -125,6 +133,11 @@ def _finalize(match_id, events, shells, trip_by_no, trip_of) -> list[dict]:
         if e["_p"] is None:
             e["_p"] = prev
         prev = e["_p"]
+    by_an = {e["action_number"]: e for e in events}
+    for e in events:
+        t = by_an.get(e.get("previous_action")) if e["action_type"] in DESCRIBES else None
+        if t is not None and t["period_ord"] == e["period_ord"] and t["_p"] is not None:
+            e["_p"] = t["_p"]
     # a possession opened by the very last event of a period/game has no events: drop it
     used = {id(e["_p"]) for e in events if e["_p"] is not None}
     kept = [s for s in shells if id(s) in used]
@@ -144,12 +157,13 @@ def _finalize(match_id, events, shells, trip_by_no, trip_of) -> list[dict]:
             continue
         r = rows[id(s)]
         e["possession_no"], e["offense_team_id"] = r["possession_no"], r["team_season_id"]
-        if r["start_seq"] is None:
+        if r["start_seq"] is None:  # events come in order; only a describing action can trail
             # the ball changed hands at the previous possession's last event
             r["start_seq"] = e["seq"]
             r["start_s"] = last_end if last_end is not None and last_end[0] == e["period_ord"] else None
             r["start_s"] = r["start_s"][1] if r["start_s"] else e["elapsed_s"]
-        r["end_seq"], r["end_s"] = e["seq"], e["elapsed_s"]
+        if r["end_seq"] is None or e["seq"] > r["end_seq"]:
+            r["end_seq"], r["end_s"] = e["seq"], e["elapsed_s"]
         last_end = (e["period_ord"], e["elapsed_s"])
         a, team, off = e["action_type"], e.get("team_season_id"), r["team_season_id"]
         trip = trip_by_no.get(trip_of.get(e["action_number"])) if a == "freethrow" else None
@@ -171,17 +185,11 @@ def _finalize(match_id, events, shells, trip_by_no, trip_of) -> list[dict]:
     return out
 
 
-def _and_one_follows(events: list[dict], i: int, trips: list[dict], team: int) -> bool:
-    """A made shot is an and-one if an 'and_one' trip for the same team was fouled at the same moment."""
-    shot = events[i]
-    for t in trips:
-        if t["trip_type"] == "and_one" and t["team_season_id"] == team and t["first_seq"] > shot["seq"] \
-                and t["period_ord"] == shot["period_ord"] and abs(t["elapsed_s"] - shot["elapsed_s"]) <= 1:
-            # no other made shot by this team in between
-            between = events[i + 1: t["first_seq"] - 1]
-            if not any(b["action_type"] in ("2pt", "3pt") and b["team_season_id"] == team for b in between):
-                return True
-    return False
+def _ball_retained_same_dead_ball(trip: dict, trips: list[dict]) -> bool:
+    """Another trip of the same team at the same moment was for a ball-retaining foul."""
+    return any(t["trip_type"] == "unsportsmanlike" and t["team_season_id"] == trip["team_season_id"]
+               and t["period_ord"] == trip["period_ord"] and t["elapsed_s"] == trip["elapsed_s"]
+               and t is not trip for t in trips)
 
 
 def _steal_follows(events: list[dict], i: int) -> bool:
