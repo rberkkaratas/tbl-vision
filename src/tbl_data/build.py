@@ -113,7 +113,7 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
             rows["tbf_shots"] += T.shotchart_rows(doc, match_id, drift)
 
     rows["teams"] = T.team_rows(reader.get("tbf", "teams", str(season.league_id)), drift)
-    rows["players"] = _players(reader, season, drift)
+    rows["players"] = _players(reader, season, drift, {r["club_id"]: r["team_season_id"] for r in rows["teams"]})
     for rid, doc in reader.iter("tbf", "player_profile"):
         rows["player_career"] += T.career_rows(doc, int(rid), drift)
 
@@ -122,9 +122,11 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
     return Staged(tables, drift.rows(), unmapped)
 
 
-def _players(reader: RawReader, season: Season, drift: Drift) -> list[dict]:
+def _players(reader: RawReader, season: Season, drift: Drift, team_of_club: dict[int, int]) -> list[dict]:
     """TBF season player list, completed and overridden by individual profiles."""
     lst = T.player_list_rows(reader.get("tbf", "player_list", f"{season.season_id}_{season.league_id}"), drift)
+    for r in lst:  # the list gives the persistent club id; staged tables use the club-season id
+        r["team_season_id"] = team_of_club.get(r.pop("club_id"))
     out = {r["player_id"]: r for r in lst}
     for rid, doc in reader.iter("tbf", "player_profile"):
         prof = T.profile_row(doc, int(rid), drift)

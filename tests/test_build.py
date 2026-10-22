@@ -117,3 +117,9 @@ def test_no_table_column_clashes_with_hive_keys():
 
     for name, model in schemas.TABLES.items():
         assert not set(schemas.polars_schema(model)) & B.HIVE_KEYS, name
+
+
+@needs_fixtures
+def test_players_join_teams(staged):
+    p = staged.tables["players"].join(staged.tables["teams"], on="team_season_id")
+    assert p.height == staged.tables["players"]["team_season_id"].drop_nulls().len() > 200

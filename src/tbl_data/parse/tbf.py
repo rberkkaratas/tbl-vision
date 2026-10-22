@@ -150,7 +150,7 @@ def player_list_rows(doc: dict, drift: Drift) -> list[dict]:
         rows.append({
             "player_id": p["kisiID"], "full_name": clean(p.get("adiSoyadi")),
             "birth_date": to_date(p.get("dogumTarihi")), "nationality": clean(p.get("tabiyet")),
-            "nationality_code": clean(p.get("tabiyetKısa")), "team_season_id": p.get("takimID"),
+            "nationality_code": clean(p.get("tabiyetKısa")), "club_id": p.get("takimID"),  # = teams.club_id
             "jersey": clean(p.get("formaNo")), "photo_url": clean(p.get("fotograf")),
         })
     return rows
