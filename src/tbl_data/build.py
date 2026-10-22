@@ -23,6 +23,8 @@ from .store.reader import RawReader
 
 log = structlog.get_logger()
 
+HIVE_KEYS = {"league", "season"}
+
 
 @dataclass
 class Staged:
@@ -148,6 +150,10 @@ def _frame(name: str, rows: list[dict]) -> pl.DataFrame:
 def write(staged: Staged, root: Path, season: Season) -> Path:
     """Write Parquet under staged/league=../season=../ and refresh DuckDB views."""
     out = root / "staged" / f"league={season.league}" / f"season={season.key}"
+    for name, df in staged.tables.items():
+        # DuckDB's hive partition values silently replace same-named file columns
+        if clash := set(df.columns) & HIVE_KEYS:
+            raise ValueError(f"table {name!r} has columns {clash} that clash with hive partition keys")
     out.mkdir(parents=True, exist_ok=True)
     for name, df in staged.tables.items():
         df.write_parquet(out / f"{name}.parquet")

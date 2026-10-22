@@ -171,7 +171,7 @@ def career_rows(doc: dict, player_id: int, drift: Drift) -> list[dict]:
     rows = []
     for c in data(doc).get("careerInfo") or []:
         drift.check("tbf.career", c, f"career/{player_id}")
-        r = {"player_id": player_id, "season": c["seasonCode"], "team_name": clean(c.get("teamName")),
+        r = {"player_id": player_id, "career_season": c["seasonCode"], "team_name": clean(c.get("teamName")),
              "competition": clean(c.get("activityName")), "competition_area": clean(c.get("faaliyetAlani")),
              "registered_at": c.get("processDate"),
              "seconds": minutes_to_s(c.get("formattedTotalSeconds"))}

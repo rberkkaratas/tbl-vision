@@ -110,3 +110,10 @@ def test_write_creates_duckdb_views(staged, tmp_path):
     n, season = con.execute("SELECT count(*), any_value(season) FROM match_players").fetchone()
     con.close()
     assert (n, season) == (22, "2026-27")
+
+
+def test_no_table_column_clashes_with_hive_keys():
+    from tbl_data import schemas
+
+    for name, model in schemas.TABLES.items():
+        assert not set(schemas.polars_schema(model)) & B.HIVE_KEYS, name

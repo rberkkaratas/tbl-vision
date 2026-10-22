@@ -223,7 +223,7 @@ class Shots(pa.DataFrameModel):
 
 class PlayerCareer(pa.DataFrameModel):
     player_id: Int
-    season: str
+    career_season: str  # e.g. "2012-2013", "UA-2010-2011" (national team); not the hive season
     team_name: str = Opt()
     competition: str = Opt()
     competition_area: str = Opt()

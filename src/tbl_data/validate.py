@@ -153,7 +153,7 @@ def career_points(t) -> Check:
     c = t["player_career"]
     bad = c.filter(pl.col("pts") != 2 * pl.col("fg2m") + 3 * pl.col("fg3m") + pl.col("ftm"))
     return Check("career_points", "career pts = 2*2PM + 3*3PM + FTM (informational)", c.height,
-                 bad.select("player_id", "season", "competition", "pts", "fg2m", "fg3m", "ftm"), blocking=False)
+                 bad.select("player_id", "career_season", "competition", "pts", "fg2m", "fg3m", "ftm"), blocking=False)
 
 
 def report(checks: list[Check]) -> pl.DataFrame:
