@@ -69,6 +69,9 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
     for name, df in files.items():
         df.write_csv(out / f"{name}.csv")
     court_image(out / "court.png")
+    from .workbook import build_workbook
+
+    build_workbook(out, out / f"{out.name}.twb")
     return {k: v.height for k, v in files.items()}
 
 

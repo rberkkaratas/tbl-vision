@@ -62,3 +62,21 @@ def test_analyze_fixture_match(staged):
     for name in ("game_flow_vs_genius", "score_timeline_final", "pairs_consistency", "assist_pairs_total"):
         assert checks[name].ok, (name, checks[name].failures)
     assert a.metrics["xpts"]["out_of_fold"] is False  # one game: nothing to hold out
+
+
+@needs_fixtures
+def test_tableau_export_writes_a_consistent_workbook(staged, tmp_path):
+    import re
+    import xml.etree.ElementTree as ET
+
+    from tbl_data.analysis.tableau import export
+
+    e = enrich(staged.tables).tables
+    a = analyze(staged.tables, e)
+    export(staged.tables, e, a.tables, tmp_path / "tbl-test")
+    root = ET.parse(tmp_path / "tbl-test" / "tbl-test.twb").getroot()
+    assert len(root.find("worksheets")) == 9 and len(root.find("dashboards")) == 3
+    for ws in root.find("worksheets"):  # every field on a shelf is declared in the sheet
+        declared = {ci.get("name") for ci in ws.iter("column-instance")}
+        used = set(re.findall(r"\]\.(\[[a-z]+:[^\]]+:[nqo]k\])", ET.tostring(ws, encoding="unicode")))
+        assert used <= declared, (ws.get("name"), used - declared)

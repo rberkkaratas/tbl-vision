@@ -7,6 +7,26 @@ CSV dosyaları ve `court.png` (FIBA yarı saha, 15 m × 14 m, dip çizgi altta).
 > görebileceği yerdedir. Kaydederken "Workbook ve verisinin indirilmesine izin ver"
 > seçeneğini kapatın; yine de veriyi gizli sayamayız.
 
+## Hazır workbook
+`tbl-2026-27.twb` aynı klasörde. İçinde 9 sayfa ve 3 dashboard hazır geliyor:
+
+- **Şut Kalitesi:** şut haritası, oyuncu dağılımı, takım şut kalitesi.
+- **İkililer:** ikili net reyting ve asist ağı.
+- **Maç Akışı:** skor farkı, geri dönüşler, clutch.
+
+Ayrıca bir "Altıgen POE" sayfası var.
+
+1. Tableau Public'i kurup `tbl-2026-27.twb` dosyasını açın.
+2. Tek elle yapılacak adım, saha görseli: **Map → Background Images → Şutlar → Add
+   Image** ile `court.png` dosyasını seçin. X Field `plot_x` (0–15), Y Field
+   `plot_y` (0–14). Aynısını "Altıgen POE" için Hex X ve Hex Y alanlarıyla yapın.
+3. **File → Save to Tableau Public As…** ile kaydedin.
+
+Workbook kodla üretiliyor (`src/tbl_data/analysis/workbook.py`) ve her `tbl analyze`
+çalıştırmasında yenileniyor. Tableau'da yaptığınız değişiklikleri kalıcı yapmak
+istiyorsanız dosyayı farklı bir adla kaydedin. Aşağıdaki adımlar aynı görünümleri
+elle kurmak ya da değiştirmek için.
+
 ## 0. Kurulum
 1. [public.tableau.com](https://public.tableau.com) üzerinden ücretsiz hesap açın ve
    **Tableau Public** (Desktop Public Edition) uygulamasını indirin.

@@ -152,7 +152,8 @@ Rules (measured on 2026-27):
 
 `uv run tbl analyze` reads the staged and enriched Parquet and writes
 `~/data/tbl/analysis/league=tbl/season=2026-27/*.parquet` (same DuckDB file), `metrics.json`,
-and flat CSVs plus a FIBA half-court image for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
+and flat CSVs, a FIBA half-court image and a ready workbook (`tbl-2026-27.twb`: 9 sheets, 3
+dashboards) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
 (see [docs/tableau.md](docs/tableau.md)).
 
 | Table | Grain | What it holds |
