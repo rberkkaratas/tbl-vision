@@ -16,6 +16,7 @@ dependencies = [
     "seleniumbase==4.56.3",
     "stamina>=26.1.0",
     "structlog>=26.1.0",
+    "tableauhyperapi==0.0.26479",
     "typer>=0.27.3",
 ]
 

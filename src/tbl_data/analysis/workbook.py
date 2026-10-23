@@ -1,13 +1,16 @@
 """A ready Tableau workbook (.twb) over the Tableau CSVs: worksheets and dashboards.
 
 Tableau has no API for building views, so the XML is written here, following what
-Tableau Public 2025.3 saves (document version 18.1). The court background image is not
-set: Tableau's XML for it is not documented, so it is one manual step (docs/tableau.md).
+Tableau Public 2025.3 saves (document version 18.1). Tableau Public only saves workbooks
+whose data sources are extracts, so every CSV also gets a Hyper extract (`<name>.hyper`)
+that its data source points to. The court background image is not set: Tableau's XML for
+it is not documented, so it is one manual step (docs/tableau.md).
 """
 
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -109,7 +112,50 @@ def _read_columns(src: Source, directory: Path) -> None:
     src.columns = {c: DATATYPES.get(df.schema[c].base_type(), "string") for c in df.columns}
 
 
-def _datasource(src: Source, directory: Path) -> ET.Element:
+HYPER_TYPES = {"string": ("TEXT", "129"), "integer": ("BIG_INT", "20"), "real": ("DOUBLE", "5"),
+               "boolean": ("BOOL", "11"), "date": ("DATE", "133")}
+
+
+def _write_extract(src: Source, directory: Path) -> Path:
+    """CSV -> Hyper file with the table Tableau expects for an extract: "Extract"."Extract"."""
+    from tableauhyperapi import (Connection, CreateMode, HyperProcess, Inserter, SqlType, TableDefinition,
+                                 TableName, Telemetry)
+
+    path = directory / src.file.replace(".csv", ".hyper")
+    df = pl.read_csv(directory / src.file, try_parse_dates=True, infer_schema_length=None).select(list(src.columns))
+    table = TableDefinition(TableName("Extract", "Extract"), [
+        TableDefinition.Column(c, getattr(SqlType, HYPER_TYPES[dt][0].lower())()) for c, dt in src.columns.items()])
+    with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper, \
+            Connection(hyper.endpoint, path, CreateMode.CREATE_AND_REPLACE) as conn:
+        conn.catalog.create_schema("Extract")
+        conn.catalog.create_table(table)
+        with Inserter(conn, table) as ins:
+            ins.add_rows(df.iter_rows())
+            ins.execute()
+    return path
+
+
+def _extract(src: Source, hyper: Path) -> ET.Element:
+    # object-id is required once the ObjectModelExtractV2 format flag is set (and rejected without it)
+    ex = ET.Element("extract", count="-1", enabled="true", units="records", **{"object-id": ""})
+    conn = ET.SubElement(ex, "connection", {
+        "access_mode": "readonly", "author-locale": "en_US", "class": "hyper", "dbname": str(hyper),
+        "default-settings": "hyper", "schema": "Extract", "sslmode": "", "tablename": "Extract",
+        "update-time": time.strftime("%m/%d/%Y %I:%M:%S %p"), "username": "tableau_internal_user"})
+    ET.SubElement(conn, "relation", name="Extract", table="[Extract].[Extract]", type="table")
+    recs = ET.SubElement(conn, "metadata-records")
+    for i, (c, dt) in enumerate(src.columns.items()):
+        r = ET.SubElement(recs, "metadata-record", {"class": "column"})
+        for tag, text in (("remote-name", c), ("remote-type", HYPER_TYPES[dt][1]), ("local-name", f"[{c}]"),
+                          ("parent-name", "[Extract]"), ("remote-alias", c), ("ordinal", str(i)),
+                          ("family", src.file), ("local-type", dt),
+                          ("aggregation", "Sum" if dt in ("integer", "real") else "Count"),
+                          ("contains-null", "true")):
+            ET.SubElement(r, tag).text = text
+    return ex
+
+
+def _datasource(src: Source, directory: Path, hyper: Path) -> ET.Element:
     table = src.file.replace(".csv", "#csv")
     conn_name = "textscan." + _id("conn", src.file)
     ds = ET.Element("datasource", caption=src.caption, inline="true", name=src.name, version=VERSION)
@@ -137,10 +183,13 @@ def _datasource(src: Source, directory: Path) -> ET.Element:
     for c in src.columns:
         dt, role, typ = src.kind(c)
         ET.SubElement(ds, "column", datatype=dt, name=f"[{c}]", role=role, type=typ)
+    ds.append(_extract(src, hyper))
     ET.SubElement(ds, "layout", {"dim-ordering": "alphabetic", "measure-ordering": "alphabetic", "show-structure": "true"})
     obj = ET.SubElement(ET.SubElement(ET.SubElement(ds, "object-graph"), "objects"), "object",
                         caption=src.file, id=f"{src.file}_{_id('obj', src.file, n=32).upper()}")
     relation(ET.SubElement(obj, "properties", context=""))
+    ET.SubElement(ET.SubElement(obj, "properties", context="extract"), "relation", name="Extract",
+                  table="[Extract].[Extract]", type="table")
     return ds
 
 
@@ -310,7 +359,7 @@ def build_workbook(directory: Path, path: Path) -> None:
     sheets = [
         Sheet("Şut haritası", shots, cols=[F("plot_x", "none", "qk")], rows=[F("plot_y", "none", "qk")],
               mark="Circle", color=F("Calculation_result"), aggregate=False, axes=court,
-              tooltip=[F("player"), F("zone"), F("xfg", "none", "qk"), F("period")],
+              tooltip=[F("player", "attr"), F("zone", "attr"), F("xfg", "attr", "qk"), F("period", "attr")],
               filters=[(F("team"), "all", None), (F("player"), "all", None), (F("zone"), "all", None),
                        (F("clutch"), "all", None), (F("transition"), "all", None)],
               title="Şut haritası (arka plan: court.png, X 0-15, Y 0-14)"),
@@ -336,7 +385,8 @@ def build_workbook(directory: Path, path: Path) -> None:
               size=F("assists", "sum", "qk"), color=F("pts", "sum", "qk"), label=[F("assists", "sum", "qk")],
               filters=[(F("team"), "member", team)], title="Kim kime asist yapıyor"),
         Sheet("Maç akışı", timeline, cols=[F("minute", "none", "qk")], rows=[F("margin_home", "none", "qk")],
-              mark="Line", aggregate=False, tooltip=[F("player"), F("home_score", "none", "qk"), F("away_score", "none", "qk")],
+              mark="Line", aggregate=False,
+              tooltip=[F("player", "attr"), F("home_score", "attr", "qk"), F("away_score", "attr", "qk")],
               filters=[(F("Calculation_match"), "member", match_label)],
               title="Skor farkı (ev sahibi − deplasman)"),
         Sheet("Geri dönüşler", flow, rows=[F("Calculation_game")], cols=[F("largest_deficit", "sum", "qk")], mark="Bar",
@@ -364,7 +414,7 @@ def build_workbook(directory: Path, path: Path) -> None:
                                  "version": VERSION})
     manifest = ET.SubElement(wb, "document-format-change-manifest")
     for tag in ("AnimationOnByDefault", "IntuitiveSorting", "IntuitiveSorting_SP2", "MarkAnimation",
-                "ObjectModelEncapsulateLegacy", "ObjectModelTableType", "SchemaViewerObjectModel",
+                "ObjectModelEncapsulateLegacy", "ObjectModelExtractV2", "ObjectModelTableType", "SchemaViewerObjectModel",
                 "SheetIdentifierTracking", "WindowsPersistSimpleIdentifiers"):
         ET.SubElement(manifest, tag)
     prefs = ET.SubElement(wb, "preferences")
@@ -372,7 +422,7 @@ def build_workbook(directory: Path, path: Path) -> None:
     ET.SubElement(prefs, "preference", name="ui.shelf.height", value="26")
     dss = ET.SubElement(wb, "datasources")
     for s in sources:
-        dss.append(_datasource(s, directory))
+        dss.append(_datasource(s, directory, _write_extract(s, directory)))
     wss = ET.SubElement(wb, "worksheets")
     for sh in sheets:
         wss.append(_worksheet(sh))

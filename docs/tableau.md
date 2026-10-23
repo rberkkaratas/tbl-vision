@@ -22,6 +22,9 @@ Ayrıca bir "Altıgen POE" sayfası var.
    `plot_y` (0–14). Aynısını "Altıgen POE" için Hex X ve Hex Y alanlarıyla yapın.
 3. **File → Save to Tableau Public As…** ile kaydedin.
 
+Tableau Public yalnızca extract kullanan workbook'ları kaydediyor; bu yüzden her CSV'nin yanında
+bir `.hyper` extract dosyası da üretiliyor ve workbook bunlara bağlı.
+
 Workbook kodla üretiliyor (`src/tbl_data/analysis/workbook.py`) ve her `tbl analyze`
 çalıştırmasında yenileniyor. Tableau'da yaptığınız değişiklikleri kalıcı yapmak
 istiyorsanız dosyayı farklı bir adla kaydedin. Aşağıdaki adımlar aynı görünümleri
