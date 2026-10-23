@@ -9,8 +9,10 @@ requires-python = ">=3.12"
 dependencies = [
     "duckdb>=2.0.0",
     "httpx>=0.28.1",
+    "matplotlib>=3.11.2",
     "pandera[polars]>=0.34.1",
     "polars>=2.0.0",
+    "scikit-learn>=1.9.1",
     "seleniumbase==4.56.3",
     "stamina>=26.1.0",
     "structlog>=26.1.0",

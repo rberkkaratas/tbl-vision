@@ -350,3 +350,59 @@ def shot_zones(e) -> Check:
     bad = sh.filter((pl.col("shot_type") == "3pt") != beyond)
     return Check("shot_zones", "2pt/3pt call matches the FIBA 3pt line at the shot location", sh.height,
                  bad.select("match_id", "action_number", "shot_type", "zone", "distance_m", "x_m", "y_m"))
+
+
+# -- analysis layer -------------------------------------------------------------------
+def run_analysis(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame], a: dict[str, pl.DataFrame],
+                 metrics: dict) -> list[Check]:
+    return [game_flow_vs_genius(s, a), score_timeline_final(s, a), xpts_calibration(a, metrics),
+            pairs_consistency(a), assist_pairs_total(e, a)]
+
+
+def game_flow_vs_genius(s, a) -> Check:
+    """Leads, runs, lead changes, ties and time leading rebuilt from our order = FIBA LiveStats' own."""
+    g = a["game_flow"].join(s["match_teams"].select(
+        "match_id", "team_season_id", g_lead="biggest_lead", g_run="biggest_run", g_lc="lead_changes",
+        g_tied="times_tied", g_tl="time_leading_s"), on=["match_id", "team_season_id"])
+    bad = g.filter((pl.col("biggest_lead") != pl.col("g_lead")) | (pl.col("biggest_run") != pl.col("g_run"))
+                   | (pl.col("lead_changes_game") != pl.col("g_lc")) | (pl.col("times_tied") != pl.col("g_tied"))
+                   | ((pl.col("time_leading_s") - pl.col("g_tl")).abs() > 2))
+    return Check("game_flow_vs_genius", "biggest lead/run, lead changes, ties, time leading (2 s) = Genius", g.height,
+                 bad.select("match_id", "team_season_id", "biggest_lead", "g_lead", "biggest_run", "g_run",
+                            "times_tied", "g_tied", "time_leading_s", "g_tl"))
+
+
+def score_timeline_final(s, a) -> Check:
+    last = a["score_timeline"].sort("seq").group_by("match_id").last()
+    j = last.join(s["matches"].select("match_id", "home_score", "away_score"), on="match_id", suffix="_official")
+    return Check("score_timeline_final", "score timeline ends on the official final score", j.height,
+                 j.filter((pl.col("home_score") != pl.col("home_score_official"))
+                          | (pl.col("away_score") != pl.col("away_score_official"))))
+
+
+def xpts_calibration(a, metrics) -> Check:
+    """Out-of-fold xPTS add up to the points scored (within 2%) and beat the zone-FG% baseline."""
+    m = metrics["xpts"]
+    sh = a["shot_xpts"]
+    rows = pl.DataFrame([{"what": "total xPTS vs points", "value": float(sh["xpts"].sum()), "target": float(sh["pts"].sum())},
+                         {"what": "log loss vs zone baseline", "value": m["log_loss"], "target": m["log_loss_zone_baseline"]}])
+    bad = rows.filter(((pl.col("what") == "total xPTS vs points") & ((pl.col("value") / pl.col("target") - 1).abs() > 0.02))
+                      | ((pl.col("what") == "log loss vs zone baseline") & (pl.col("value") >= pl.col("target"))))
+    return Check("xpts_calibration", f"xPTS sum within 2% of points; log loss {m['log_loss']} < zone baseline "
+                 f"{m['log_loss_zone_baseline']} (out-of-fold: {m['out_of_fold']})", sh.height, bad)
+
+
+def pairs_consistency(a) -> Check:
+    p = a["pairs"]
+    bad = p.filter((pl.col("a_without_b_seconds") < -0.5) | (pl.col("b_without_a_seconds") < -0.5)
+                   | (pl.col("a_without_b_poss_for") < 0) | (pl.col("b_without_a_poss_for") < 0))
+    return Check("pairs_consistency", "together + apart = each player's on-court totals (no negative remainder)",
+                 p.height, bad.select("team_season_id", "player_a", "player_b", "seconds"))
+
+
+def assist_pairs_total(e, a) -> Check:
+    n = e["shots_enriched"].filter(pl.col("assisted")).group_by("team_season_id").agg(n=pl.len())
+    t = a["assist_pairs"].group_by("team_season_id").agg(t=pl.col("assists").sum())
+    j = n.join(t, on="team_season_id", how="full", coalesce=True).fill_null(0)
+    return Check("assist_pairs_total", "assist network adds up to assisted shots per team", j.height,
+                 j.filter(pl.col("n") != pl.col("t")))

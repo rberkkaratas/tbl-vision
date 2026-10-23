@@ -29,6 +29,7 @@ uv run tbl sync --max-requests 20         # small trial run
 uv run tbl sync --only genius             # Genius only (needs fixtures already fetched)
 uv run tbl status
 uv run tbl build                          # raw -> staged -> enriched Parquet + DuckDB views + validation
+uv run tbl analyze                        # enriched -> analysis tables + Tableau CSVs + validation
 uv run tbl sql "SELECT * FROM matches LIMIT 5"
 ```
 
@@ -144,3 +145,38 @@ Rules (measured on 2026-27):
   Genius' default spot are `location_imputed`. A fouled missed shot is not a field goal
   attempt in FIBA stats, so `fouled` means and-one. `possession_elapsed_s` can pass 24 s
   after an offensive rebound. `margin_before` is replayed in our order.
+  The Genius `fastbreak` qualifier marks fast-break *points* (every tagged shot is a make),
+  so use `transition` from `analysis.shot_xpts` for fast-break shooting.
+
+## Analysis tables
+
+`uv run tbl analyze` reads the staged and enriched Parquet and writes
+`~/data/tbl/analysis/league=tbl/season=2026-27/*.parquet` (same DuckDB file), `metrics.json`,
+and flat CSVs plus a FIBA half-court image for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
+(see [docs/tableau.md](docs/tableau.md)).
+
+| Table | Grain | What it holds |
+|---|---|---|
+| `shot_xpts` | shot | `xfg` (make probability), `xpts`, `transition`, shot `family` |
+| `xpts_coefficients` | model term | logistic regression coefficients (log-odds per SD) |
+| `player_shooting`, `player_zone_shooting`, `team_shooting` | player / player x zone / team x offense-defense | points vs xPTS: `poe`, `poe_per_shot` ± `poe_se`, shot quality `xpts_per_shot` |
+| `pairs` | team x two players | seconds, possessions, ortg/drtg/net together and each one without the other |
+| `assist_pairs` | passer -> scorer | assisted baskets, points, by zone |
+| `score_timeline` | scoring action | running score and margin, plus 0-0 and the final |
+| `game_flow` | team-game | biggest lead and run, lead changes, ties, time leading, largest deficit |
+| `runs` | run of 8+ points | team, points, start/end time, margin before and after |
+| `clutch_possessions`, `clutch_team`, `clutch_player` | possession / team / player | last 5 min of Q4/OT within 5 points |
+
+- **xPTS**: logistic regression on distance (spline), angle, 2/3, end of period, shot family,
+  second chance, transition, off a turnover, seconds into the possession and margin; no
+  shooter identity. Every shot is predicted by a model fitted without its game (5 folds
+  grouped by match). On 2026-27: log loss 0.647 vs 0.659 for zone FG% and 0.687 for a
+  constant, xPTS 1.033 per shot vs 1.031 scored. Left out because the feed only knows
+  them after the outcome: the `fastbreak` tag, detailed shot sub-types (scorers label
+  makes more specifically), assisted, blocked, fouled. Free throws are not in xPTS.
+- **Game flow** reproduces FIBA LiveStats' own biggest lead, biggest run, lead changes,
+  times tied and time leading for all 112 team-games (a period starting level counts as
+  a tie, as LiveStats does).
+- **Small samples**: 6-7 games per team. Pair ratings and clutch numbers come with their
+  possession counts and `poe_se` gives the noise in points over expected; filter on
+  them (e.g. pairs with 100+ possessions) rather than reading single numbers.

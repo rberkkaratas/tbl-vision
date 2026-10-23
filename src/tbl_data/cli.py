@@ -1,4 +1,4 @@
-"""tbl command line: sync raw data, show status."""
+"""tbl command line: sync raw data, build tables, analyse, show status."""
 
 from __future__ import annotations
 
@@ -117,6 +117,49 @@ def build(
             if not c.ok:
                 typer.echo(f"\n{c.name}:\n{c.failures.head(5)}")
     typer.echo(f"\nquery: uv run tbl sql \"SELECT * FROM matches LIMIT 5\"   (DuckDB: {root / 'tbl.duckdb'})")
+    if any(c.blocking and not c.ok for c in checks):
+        raise typer.Exit(1)
+
+
+@app.command()
+def analyze(
+    season: str = "2026-27",
+    league: str = "tbl",
+    data: DataDir = None,
+    tableau: Annotated[bool, typer.Option(help="Also write CSVs + court image for Tableau")] = True,
+    verbose: bool = False,
+) -> None:
+    """enriched -> analysis tables (xPTS, pairs, game flow, clutch) + Tableau CSVs, then validation."""
+    import json
+
+    from . import build as B
+    from . import validate as V
+    from .analysis import analyze as run_analysis
+    from .analysis.tableau import export
+
+    _setup_logging(verbose)
+    s = get_season(league, season)
+    root = data or data_dir()
+    staged, enriched = B.read_layer(root, "staged", s), B.read_layer(root, "enriched", s)
+    a = run_analysis(staged, enriched)
+    out = B.write_layer(root, "analysis", s, a.tables)
+    (out / "metrics.json").write_text(json.dumps(a.metrics, indent=2))
+    typer.echo(f"\nanalysis -> {out}")
+    for name, df in a.tables.items():
+        typer.echo(f"  {name:<22} {df.height:>7} rows")
+    typer.echo(f"\nxPTS model: {json.dumps(a.metrics['xpts'])}")
+    if tableau:
+        tdir = root / "tableau" / f"{s.league}-{s.key}"
+        n = export(staged, enriched, a.tables, tdir)
+        typer.echo(f"\ntableau -> {tdir}  ({', '.join(f'{k} {v}' for k, v in n.items())}, court.png)")
+    checks = V.run_analysis(staged, enriched, a.tables, a.metrics)
+    typer.echo("\nvalidation")
+    for c in checks:
+        mark = "ok  " if c.ok else ("FAIL" if c.blocking else "note")
+        typer.echo(f"  {mark} {c.name:<22} {c.failures.height:>4} / {c.checked:<6} {c.description}")
+    for c in checks:
+        if not c.ok:
+            typer.echo(f"\n{c.name}:\n{c.failures.head(5)}")
     if any(c.blocking and not c.ok for c in checks):
         raise typer.Exit(1)
 

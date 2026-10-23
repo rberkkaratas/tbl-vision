@@ -172,10 +172,29 @@ def write(staged: Staged, root: Path, season: Season, enriched: dict[str, pl.Dat
     return out
 
 
+def read_layer(root: Path, layer: str, season: Season) -> dict[str, pl.DataFrame]:
+    d = root / layer / f"league={season.league}" / f"season={season.key}"
+    if not d.exists():
+        raise FileNotFoundError(f"{d} not found; run `tbl build` first")
+    return {p.stem: pl.read_parquet(p) for p in sorted(d.glob("*.parquet"))}
+
+
+def write_layer(root: Path, layer: str, season: Season, tables: dict[str, pl.DataFrame]) -> Path:
+    out = root / layer / f"league={season.league}" / f"season={season.key}"
+    for name, df in tables.items():
+        if clash := set(df.columns) & HIVE_KEYS:
+            raise ValueError(f"table {name!r} has columns {clash} that clash with hive partition keys")
+    out.mkdir(parents=True, exist_ok=True)
+    for name, df in tables.items():
+        df.write_parquet(out / f"{name}.parquet")
+    refresh_views(root)
+    return out
+
+
 def refresh_views(root: Path) -> None:
     con = duckdb.connect(str(root / "tbl.duckdb"))
     try:
-        for layer in ("staged", "enriched"):
+        for layer in ("staged", "enriched", "analysis"):
             for name in sorted({p.stem for p in (root / layer).glob("*/*/*.parquet")}):
                 glob = (root / layer / "*" / "*" / f"{name}.parquet").as_posix()
                 con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{glob}', "
