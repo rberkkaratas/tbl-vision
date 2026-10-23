@@ -15,6 +15,15 @@ import polars as pl
 
 COURT_W, HALF_L = 15.0, 14.0
 RIM = (7.5, 1.575)
+START_LABELS = {"after_defensive_rebound": "Savunma ribaundu sonrası", "after_made_fg": "Sayı sonrası",
+                "after_steal": "Top çalma sonrası", "after_turnover": "Ölü top kaybı sonrası",
+                "after_made_ft": "Serbest atış sonrası", "period_start": "Periyot başı", "jumpball": "Hava atışı",
+                "unsportsmanlike_foul": "Sportmenlik dışı faul", "inferred": "Belirsiz (veri boşluğu)"}
+# (column, label, side, +1 if higher is better for the team)
+FOUR_FACTORS = [("efg", "eFG%", "Hücum", 1), ("tov_pct", "Top kaybı %", "Hücum", -1),
+                ("orb_pct", "Hücum ribaundu %", "Hücum", 1), ("ft_rate", "Serbest atış oranı", "Hücum", 1),
+                ("opp_efg", "eFG%", "Savunma", -1), ("opp_tov_pct", "Top kaybı %", "Savunma", 1),
+                ("drb_pct", "Savunma ribaundu %", "Savunma", 1), ("opp_ft_rate", "Serbest atış oranı", "Savunma", -1)]
 
 
 def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], tables: dict[str, pl.DataFrame],
@@ -64,6 +73,14 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
         "game_flow": tables["game_flow"].join(m, on="match_id").join(teams, on="team_season_id").join(opp, on="opponent_id"),
         "runs": tables["runs"].join(m, on="match_id").join(teams, on="team_season_id"),
         "clutch_team": tables["clutch_team"].join(teams, on="team_season_id"),
+        "team_profiles": tables["team_profiles"].join(teams, on="team_season_id", how="left").with_columns(
+            team=pl.col("team").fill_null("Lig ortalaması"), team_code=pl.coalesce("team_code", "team")),
+        "four_factors": four_factors(tables["team_profiles"]).join(teams, on="team_season_id"),
+        "possession_starts": tables["possession_starts"].join(teams, on="team_season_id").with_columns(
+            start=pl.col("start_type").replace_strict(START_LABELS, default=pl.col("start_type")),
+            side=pl.col("side").replace_strict({"offense": "Hücum", "defense": "Savunma"})),
+        "player_profiles": tables["player_profiles"],
+        "player_percentiles": tables["player_percentiles"],
         "clutch_player": tables["clutch_player"].join(names, on="player_id").join(teams, on="team_season_id"),
     }
     for name, df in files.items():
@@ -73,6 +90,15 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
 
     build_workbook(out, out / f"{out.name}.twb")
     return {k: v.height for k, v in files.items()}
+
+
+def four_factors(teams: pl.DataFrame) -> pl.DataFrame:
+    """Long format: team x factor, with the league value and how much better (+) or worse the team is."""
+    league = teams.filter(pl.col("is_league")).row(0, named=True)
+    t = teams.filter(~pl.col("is_league"))
+    return pl.concat([t.select("team_season_id", value=pl.col(c)).with_columns(
+        factor=pl.lit(label), side=pl.lit(side), league=pl.lit(league[c]),
+        better=((pl.col("value") - league[c]) * sign).round(3)) for c, label, side, sign in FOUR_FACTORS])
 
 
 def court_image(path: Path, px_per_m: int = 100) -> None:

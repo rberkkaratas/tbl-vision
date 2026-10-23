@@ -356,7 +356,7 @@ def shot_zones(e) -> Check:
 def run_analysis(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame], a: dict[str, pl.DataFrame],
                  metrics: dict) -> list[Check]:
     return [game_flow_vs_genius(s, a), score_timeline_final(s, a), xpts_calibration(a, metrics),
-            pairs_consistency(a), assist_pairs_total(e, a)]
+            pairs_consistency(a), assist_pairs_total(e, a), team_profile_totals(s, a), player_on_court_totals(e, a)]
 
 
 def game_flow_vs_genius(s, a) -> Check:
@@ -406,3 +406,29 @@ def assist_pairs_total(e, a) -> Check:
     j = n.join(t, on="team_season_id", how="full", coalesce=True).fill_null(0)
     return Check("assist_pairs_total", "assist network adds up to assisted shots per team", j.height,
                  j.filter(pl.col("n") != pl.col("t")))
+
+
+def team_profile_totals(s, a) -> Check:
+    """Team profiles add up to the box score, and the league row balances (ORtg = DRtg)."""
+    t = a["team_profiles"]
+    box = s["match_teams"].group_by("team_season_id").agg(box_pts=pl.col("pts").sum(), box_games=pl.len())
+    j = t.filter(~pl.col("is_league")).join(box, on="team_season_id", how="full", coalesce=True)
+    lg = t.filter(pl.col("is_league"))
+    bad = pl.concat([
+        j.filter((pl.col("pts") != pl.col("box_pts")) | (pl.col("games") != pl.col("box_games")))
+        .select("team_season_id", problem=pl.lit("points/games differ from box")),
+        lg.filter(pl.col("ortg") != pl.col("drtg")).select("team_season_id", problem=pl.lit("league ORtg != DRtg")),
+    ])
+    return Check("team_profile_totals", "team points/games = box; league ORtg = DRtg", j.height + 1, bad)
+
+
+def player_on_court_totals(e, a) -> Check:
+    """Each team possession is on five players' records; usage averages 20% on court."""
+    p = a["player_profiles"]
+    n = e["possessions"].group_by("team_season_id").agg(n=pl.len())
+    j = p.group_by("team_season_id").agg(
+        on=pl.col("on_poss_for").sum(),
+        usg=(pl.col("usg") * pl.col("on_team_plays")).sum() / pl.col("on_team_plays").sum()).join(n, on="team_season_id")
+    bad = j.filter((pl.col("on") != 5 * pl.col("n")) | ~pl.col("usg").is_between(0.19, 0.21))
+    return Check("player_on_court_totals", "players' on-court possessions = 5 x team's; usage averages 19-21%",
+                 j.height, bad)

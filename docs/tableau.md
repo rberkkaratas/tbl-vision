@@ -8,11 +8,15 @@ CSV dosyaları ve `court.png` (FIBA yarı saha, 15 m × 14 m, dip çizgi altta).
 > seçeneğini kapatın; yine de veriyi gizli sayamayız.
 
 ## Hazır workbook
-`tbl-2026-27.twb` aynı klasörde. İçinde 9 sayfa ve 3 dashboard hazır geliyor:
+`tbl-2026-27.twb` aynı klasörde. İçinde 15 sayfa ve 5 dashboard hazır geliyor:
 
 - **Şut Kalitesi:** şut haritası, oyuncu dağılımı, takım şut kalitesi.
 - **İkililer:** ikili net reyting ve asist ağı.
 - **Maç Akışı:** skor farkı, geri dönüşler, clutch.
+- **Takım Profili:** hücum × savunma reytingi, Four Factors ısı haritası, hücumun nasıl
+  başladığına göre verim.
+- **Oyuncu Profili:** seçilen oyuncunun ligdeki yüzdelik dilimleri, kullanım × TS%,
+  takım bazında on/off.
 
 Ayrıca bir "Altıgen POE" sayfası var.
 
@@ -48,6 +52,11 @@ elle kurmak ya da değiştirmek için.
 | `pairs.csv` | takım × iki oyuncu | birlikte / ayrı net reyting |
 | `assist_pairs.csv` | pas veren → atan | asist ağı |
 | `score_timeline.csv` | her sayı | maç akışı grafiği |
+| `team_profiles.csv` | takım (+ lig satırı) | tempo, reytingler, Four Factors, şut dağılımı |
+| `four_factors.csv` | takım × faktör | lig ortalamasına göre iyi/kötü (`better` > 0 iyi) |
+| `possession_starts.csv` | takım × hücum/savunma × başlangıç | hücum başına sayı |
+| `player_profiles.csv` | oyuncu | maç başı, 40 dk başı, oranlar, on/off |
+| `player_percentiles.csv` | oyuncu × metrik | 100+ dakika oynayanlar arasında yüzdelik |
 | `game_flow.csv`, `runs.csv` | takım-maç / seri | geri dönüşler, seriler |
 | `clutch_team.csv`, `clutch_player.csv` | takım / oyuncu | son 5 dakika, fark ≤ 5 |
 

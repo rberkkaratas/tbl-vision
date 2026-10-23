@@ -348,12 +348,19 @@ def build_workbook(directory: Path, path: Path) -> None:
                   calcs=[Calc("game", "Maç (takım)", 'STR([date]) + "  " + [team] + " - " + [opponent]', "string",
                               "dimension", "nominal")])
     clutch = Source("clutch_team.csv", "Clutch takım", dimensions=("team_season_id",))
-    sources = [shots, players, teams, pairs, assists, timeline, flow, clutch]
+    tprof = Source("team_profiles.csv", "Takım profili", dimensions=("team_season_id",))
+    factors = Source("four_factors.csv", "Four Factors", dimensions=("team_season_id",))
+    starts = Source("possession_starts.csv", "Hücum başlangıçları", dimensions=("team_season_id",))
+    pprof = Source("player_profiles.csv", "Oyuncu profili", dimensions=("team_season_id", "player_id"))
+    pct = Source("player_percentiles.csv", "Oyuncu yüzdelikleri", dimensions=("team_season_id", "player_id"))
+    sources = [shots, players, teams, pairs, assists, timeline, flow, clutch, tprof, factors, starts, pprof, pct]
     for s in sources:
         _read_columns(s, directory)
     first_match = pl.read_csv(directory / "score_timeline.csv", try_parse_dates=True).sort("date", "match_id").row(0, named=True)
     match_label = f"{first_match['date']}  {first_match['home']} - {first_match['away']}"
     team = pl.read_csv(directory / "pairs.csv").group_by("team").agg(pl.col("poss").max()).sort("poss", descending=True)["team"][0]
+    pp = pl.read_csv(directory / "player_profiles.csv")  # default player: highest usage, qualified if any are
+    star = (pp.filter(pl.col("qualified")) if pp["qualified"].any() else pp).sort("usg", descending=True, nulls_last=True)["player"][0]
 
     court = [(F("plot_x", "none", "qk"), "cols", 0.0, 15.0), (F("plot_y", "none", "qk"), "rows", 0.0, 14.0)]
     sheets = [
@@ -395,6 +402,32 @@ def build_workbook(directory: Path, path: Path) -> None:
               title="Kazanan takımın kapattığı en büyük fark (8+)"),
         Sheet("Clutch", clutch, rows=[F("team")], cols=[F("net", "sum", "qk")], mark="Bar",
               label=[F("poss", "sum", "qk")], title="Son 5 dk, fark ≤ 5: net reyting (etiket: hücum)"),
+        Sheet("Takım reytingleri", tprof, cols=[F("ortg", "sum", "qk")], rows=[F("drtg", "sum", "qk")], mark="Circle",
+              label=[F("team_code")], detail=[F("team")], size=F("games", "sum", "qk"),
+              tooltip=[F("net", "sum", "qk"), F("pace", "sum", "qk"), F("wins", "sum", "qk")],
+              filters=[(F("is_league"), "member", "false")],
+              title="Hücum (x) ve savunma (y) reytingi, 100 hücumda sayı: sağ alt en iyisi"),
+        Sheet("Four Factors", factors, rows=[F("team")], cols=[F("side"), F("factor")], mark="Square",
+              color=F("better", "sum", "qk"), label=[F("value", "sum", "qk")], tooltip=[F("league", "sum", "qk")],
+              title="Four Factors: yeşil lig ortalamasından iyi, kırmızı kötü"),
+        Sheet("Hücum başlangıçları", starts, rows=[F("start"), F("side")], cols=[F("ppp", "sum", "qk")], mark="Bar",
+              color=F("side"), label=[F("ppp", "sum", "qk")],
+              tooltip=[F("poss", "sum", "qk"), F("share", "sum", "qk"), F("league_ppp", "sum", "qk")],
+              filters=[(F("team"), "member", team)],
+              title="Hücum nasıl başlarsa kaç sayı getiriyor (hücum başına sayı)"),
+        Sheet("Oyuncu profili", pct, rows=[F("label")], cols=[F("pct", "sum", "qk")], mark="Bar",
+              color=F("pct", "sum", "qk"), label=[F("value", "sum", "qk")], filters=[(F("player"), "member", star)],
+              axes=[(F("pct", "sum", "qk"), "cols", 0.0, 100.0)],
+              title="Ligdeki yeri: yüzdelik (en az 100 dakika oynayanlar arasında)"),
+        Sheet("Kullanım × verimlilik", pprof, cols=[F("usg", "sum", "qk")], rows=[F("ts", "sum", "qk")], mark="Circle",
+              color=F("team"), size=F("minutes", "sum", "qk"), detail=[F("player")],
+              tooltip=[F("ppg", "sum", "qk"), F("mpg", "sum", "qk")], filters=[(F("qualified"), "member", "true")],
+              title="Kullanım oranı (x) ve gerçek şut yüzdesi TS% (y)"),
+        Sheet("On/Off", pprof, rows=[F("player")], cols=[F("on_off", "sum", "qk")], mark="Bar",
+              label=[F("on_off", "sum", "qk")], tooltip=[F("on_net", "sum", "qk"), F("off_net", "sum", "qk"),
+                                                         F("minutes", "sum", "qk")],
+              filters=[(F("team"), "member", team), (F("qualified"), "member", "true")],
+              title="Oyuncu sahadayken ve kenardayken takımın net reyting farkı"),
     ]
     by = {s.name: s for s in sheets}
     dashboards = [
@@ -408,6 +441,14 @@ def build_workbook(directory: Path, path: Path) -> None:
         _dashboard("Maç Akışı", "TBL 2026-27 · Maç akışı, geri dönüşler, clutch",
                    [("Maç akışı", 1000, 8000, 98000, 44000), ("Geri dönüşler", 1000, 53000, 55000, 46000),
                     ("Clutch", 57000, 53000, 42000, 46000)], []),
+        _dashboard("Takım Profili", "TBL 2026-27 · Takım profilleri",
+                   [("Takım reytingleri", 1000, 8000, 40000, 44000), ("Hücum başlangıçları", 1000, 53000, 40000, 39000),
+                    ("Four Factors", 42000, 8000, 57000, 91000)],
+                   [(by["Hücum başlangıçları"], F("team"), 1000, 92500, 25000, 6500, True)]),
+        _dashboard("Oyuncu Profili", "TBL 2026-27 · Oyuncu profilleri",
+                   [("Oyuncu profili", 1000, 15000, 45000, 84000), ("Kullanım × verimlilik", 47000, 8000, 52000, 45000),
+                    ("On/Off", 47000, 54000, 52000, 45000)],
+                   [(by["Oyuncu profili"], F("player"), 1000, 8000, 30000, 6500, True)]),
     ]
 
     wb = ET.Element("workbook", {"original-version": VERSION, "source-build": BUILD, "source-platform": "mac",

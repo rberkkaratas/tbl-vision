@@ -152,8 +152,8 @@ Rules (measured on 2026-27):
 
 `uv run tbl analyze` reads the staged and enriched Parquet and writes
 `~/data/tbl/analysis/league=tbl/season=2026-27/*.parquet` (same DuckDB file), `metrics.json`,
-and flat CSVs, a FIBA half-court image and a ready workbook (`tbl-2026-27.twb`: 9 sheets, 3
-dashboards) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
+and flat CSVs, a FIBA half-court image and a ready workbook (`tbl-2026-27.twb`: 15 sheets, 5
+dashboards, on Hyper extracts) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
 (see [docs/tableau.md](docs/tableau.md)).
 
 | Table | Grain | What it holds |
@@ -161,6 +161,10 @@ dashboards) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
 | `shot_xpts` | shot | `xfg` (make probability), `xpts`, `transition`, shot `family` |
 | `xpts_coefficients` | model term | logistic regression coefficients (log-odds per SD) |
 | `player_shooting`, `player_zone_shooting`, `team_shooting` | player / player x zone / team x offense-defense | points vs xPTS: `poe`, `poe_per_shot` ± `poe_se`, shot quality `xpts_per_shot` |
+| `team_profiles` | team (+ a league row) | pace, ORtg/DRtg/net on counted possessions, four factors for and against, shot diet by zone, xPTS per shot |
+| `possession_starts` | team x offense/defense x start | possessions and points per possession by how they start |
+| `player_profiles` | player x team | per game and per 40, TS%, eFG%, USG%, AST%, ORB%/DRB%, STL%, BLK%, TOV%, on/off, xPTS shot quality and making |
+| `player_percentiles` | player x metric | percentile among players with 100+ minutes |
 | `pairs` | team x two players | seconds, possessions, ortg/drtg/net together and each one without the other |
 | `assist_pairs` | passer -> scorer | assisted baskets, points, by zone |
 | `score_timeline` | scoring action | running score and margin, plus 0-0 and the final |
@@ -178,6 +182,11 @@ dashboards) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
 - **Game flow** reproduces FIBA LiveStats' own biggest lead, biggest run, lead changes,
   times tied and time leading for all 112 team-games (a period starting level counts as
   a tie, as LiveStats does).
+- **Profiles**: player rates use what happened while the player was on court (lineups on
+  every event): USG% = player (FGA + 0.44 FTA + TOV) / the team's on court, so it averages
+  20%; AST% = assists / teammates' field goals on court; rebound, steal and block rates use
+  on-court opportunities; on/off = team net rating on minus off. Team ratings use counted
+  possessions and box points (technical FTs included).
 - **Small samples**: 6-7 games per team. Pair ratings and clutch numbers come with their
   possession counts and `poe_se` gives the noise in points over expected; filter on
   them (e.g. pairs with 100+ possessions) rather than reading single numbers.

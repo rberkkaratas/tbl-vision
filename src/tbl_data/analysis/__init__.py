@@ -1,4 +1,4 @@
-"""staged + enriched -> analysis tables: xPTS, shooting summaries, pairs, game flow, clutch."""
+"""staged + enriched -> analysis tables: xPTS, shooting, team and player profiles, pairs, game flow, clutch."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import polars as pl
 import structlog
 
-from . import flow, pairs, xpts
+from . import flow, pairs, profiles, xpts
 
 log = structlog.get_logger()
 
@@ -24,13 +24,20 @@ def analyze(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame]) 
     timeline = flow.score_timeline(ev, mt)
     games, runs = flow.game_flow(timeline, mt)
     clutch_poss, clutch_team, clutch_player = flow.clutch(enriched["possessions"], timeline, ev, mt)
+    player_shooting = shooting(x.shots, ["team_season_id", "player_id"])
+    team_prof, starts = profiles.team_profiles(staged, enriched, x.shots)
+    player_prof, percentiles = profiles.player_profiles(staged, enriched, player_shooting)
     tables = {
         "shot_xpts": x.shots.select("match_id", "action_number", "team_season_id", "player_id", "family",
                                     "transition", "value", "pts", "xfg", "xpts"),
         "xpts_coefficients": x.coefficients,
-        "player_shooting": shooting(x.shots, ["team_season_id", "player_id"]),
+        "player_shooting": player_shooting,
         "player_zone_shooting": zone_shooting(x.shots),
         "team_shooting": team_shooting(x.shots, mt),
+        "team_profiles": team_prof,
+        "possession_starts": starts,
+        "player_profiles": player_prof,
+        "player_percentiles": percentiles,
         "pairs": pairs.pair_on_court(enriched["stints"]),
         "assist_pairs": pairs.assist_pairs(enriched["shots_enriched"]),
         "score_timeline": timeline,
