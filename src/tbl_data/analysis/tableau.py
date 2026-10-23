@@ -13,6 +13,8 @@ from pathlib import Path
 
 import polars as pl
 
+from .presentation import augment, team_codes
+
 COURT_W, HALF_L = 15.0, 14.0
 RIM = (7.5, 1.575)
 START_LABELS = {"after_defensive_rebound": "Savunma ribaundu sonrası", "after_made_fg": "Sayı sonrası",
@@ -31,7 +33,7 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
     out.mkdir(parents=True, exist_ok=True)
     teams = staged["teams"].select("team_season_id", team="name", team_code="code")
     opp = staged["teams"].select(opponent_id="team_season_id", opponent="name")
-    names = staged["match_players"].group_by("player_id").agg(player=pl.col("name").first())
+    names = player_names(staged)
     m = staged["matches"].select("match_id", "week", "phase", date=pl.col("start_utc").dt.date())
     mt = staged["match_teams"].select("match_id", "team_season_id", "is_home")
     opp_of = mt.join(mt.select("match_id", opponent_id="team_season_id"), on="match_id").filter(
@@ -83,6 +85,7 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
         "player_percentiles": tables["player_percentiles"],
         "clutch_player": tables["clutch_player"].join(names, on="player_id").join(teams, on="team_season_id"),
     }
+    files = augment(files, team_codes(staged["teams"]))
     for name, df in files.items():
         df.write_csv(out / f"{name}.csv")
     court_image(out / "court.png")
@@ -90,6 +93,11 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
 
     build_workbook(out, out / f"{out.name}.twb")
     return {k: v.height for k, v in files.items()}
+
+
+def player_names(staged: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """player_id -> one name: TBF's full name (Genius spells a player differently from game to game)."""
+    return staged["players"].select("player_id", player="full_name").unique("player_id")
 
 
 def four_factors(teams: pl.DataFrame) -> pl.DataFrame:

@@ -129,7 +129,7 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         on_opp_dreb=(~own & (a == "rebound") & (sub == "defensive")).sum(),
         on_opp_fg2a=(~own & (a == "2pt")).sum())
 
-    names = mp.group_by("player_id").agg(player=pl.col("name").first())
+    names = staged["players"].select("player_id", player="full_name").unique("player_id")  # TBF: one spelling
     info = staged["players"].select("player_id", "nationality", "birth_date").unique("player_id").with_columns(
         age=((pl.lit(SEASON_START) - pl.col("birth_date")).dt.total_days() / 365.25).round(1))
     teams = staged["teams"].select("team_season_id", team="name")

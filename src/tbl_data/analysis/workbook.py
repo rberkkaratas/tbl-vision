@@ -1,15 +1,18 @@
-"""A ready Tableau workbook (.twb) over the Tableau CSVs: worksheets and dashboards.
+"""Tableau workbook (.twb) writer: parameters, data sources over CSV + Hyper extracts,
+worksheets, dashboards and parameter actions.
 
-Tableau has no API for building views, so the XML is written here, following what
-Tableau Public 2025.3 saves (document version 18.1). Tableau Public only saves workbooks
-whose data sources are extracts, so every CSV also gets a Hyper extract (`<name>.hyper`)
-that its data source points to. The court background image is not set: Tableau's XML for
-it is not documented, so it is one manual step (docs/tableau.md).
+Tableau has no API for building views, so the XML is written here, following what Tableau
+saves (document version 18.1; patterns taken from workbooks saved by Tableau 2024.3-2026.3).
+Tableau validates the document on open, so only elements and attributes seen in real
+workbooks are used. Tableau Public only saves workbooks whose data sources are extracts,
+so every CSV also gets a Hyper extract (`<name>.hyper`). What the dashboards contain is in
+dashboards.py.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -22,7 +25,10 @@ USER_NS = "http://www.tableausoftware.com/xml/user"
 ET.register_namespace("user", USER_NS)
 U = "{%s}" % USER_NS
 VERSION = "18.1"
-BUILD = "2025.3.1 (20253.25.1210.1815)"
+BUILD = "2026.3.0 (20263.26.1015.1742)"
+DERIV = {"none": "None", "sum": "Sum", "avg": "Avg", "min": "Min", "max": "Max", "cnt": "Count", "usr": "User",
+         "attr": "Attribute"}
+KIND = {"nk": "nominal", "ok": "ordinal", "qk": "quantitative"}
 
 
 def _id(*parts: str, n: int = 28) -> str:
@@ -33,14 +39,38 @@ def _uuid(*parts: str) -> str:
     return "{" + str(uuid.UUID(hashlib.md5("|".join(parts).encode()).hexdigest())).upper() + "}"
 
 
+def _q(v) -> str:
+    """A literal as Tableau writes it in value/member attributes and formulas."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return '"' + str(v).replace('"', '""') + '"'
+
+
+# -- model ------------------------------------------------------------------------------
+@dataclass
+class Param:
+    caption: str
+    datatype: str  # string / integer / real
+    default: object
+    members: list[tuple[object, str | None]] = field(default_factory=list)  # (value, alias) for a list
+    range: tuple[float, float, float] | None = None  # (min, max, step) for a range
+    name: str = ""  # set by Workbook: Parameter N
+
+    @property
+    def ref(self) -> str:
+        return f"[Parameters].[{self.name}]"
+
+
 @dataclass
 class Calc:
-    key: str  # internal name, Calculation_<key>
+    key: str
     caption: str
-    formula: str
-    datatype: str  # string/integer/real/boolean/date
-    role: str  # dimension/measure
-    type: str  # nominal/ordinal/quantitative
+    formula: str  # may use {Takım}-style placeholders for parameter captions
+    datatype: str
+    role: str = "dimension"  # dimension / measure
+    type: str = "nominal"  # nominal / ordinal / quantitative
 
     @property
     def name(self) -> str:
@@ -48,39 +78,67 @@ class Calc:
 
 
 @dataclass
+class F:
+    """A field on a shelf: column or calc name, derivation, n(ominal)/o(rdinal)/q(uantitative)."""
+    col: str
+    deriv: str = "none"
+    kind: str = "nk"
+
+    @property
+    def inst(self) -> str:
+        return f"[{self.deriv}:{self.col}:{self.kind}]"
+
+
+@dataclass
 class Source:
-    file: str  # CSV file name in the export directory
+    file: str
     caption: str
-    dimensions: tuple[str, ...] = ()  # numeric columns to treat as dimensions
+    dimensions: tuple[str, ...] = ()  # numeric columns used as dimensions
     calcs: list[Calc] = field(default_factory=list)
+    captions: dict[str, str] = field(default_factory=dict)
+    # colour per value of a field: a row-level field as "[none:name:nk]", an aggregate calc by its bare name
+    colors: dict[str, dict[str, str]] = field(default_factory=dict)
+    image: tuple[str, str, str, tuple[float, float, float, float]] | None = None  # (file, x, y, (left, right, bottom, top))
     columns: dict[str, str] = field(default_factory=dict)  # filled from the CSV: name -> datatype
 
     @property
     def name(self) -> str:
         return "federated." + _id("ds", self.file)
 
+    def calc(self, name: str) -> Calc | None:
+        return next((c for c in self.calcs if c.name == name), None)
+
     def kind(self, col: str) -> tuple[str, str, str]:
-        """(datatype, role, type) of a column or calc."""
-        for c in self.calcs:
-            if col == c.name:
-                return c.datatype, c.role, c.type
+        c = self.calc(col)
+        if c:
+            return c.datatype, c.role, c.type
         dt = self.columns[col]
-        if dt in ("string", "boolean", "date"):
-            return dt, "dimension", "nominal" if dt != "date" else "ordinal"
+        if dt in ("string", "boolean"):
+            return dt, "dimension", "nominal"
+        if dt == "date":
+            return dt, "dimension", "ordinal"
         if col in self.dimensions:
             return dt, "dimension", "quantitative" if dt == "real" else "ordinal"
         return dt, "measure", "quantitative"
 
 
 @dataclass
-class F:
-    """A field on a shelf: column + derivation (none/sum/avg/cnt/usr) + n(ominal) / o(rdinal) / q(uant.)."""
-    col: str
-    deriv: str = "none"
-    kind: str = "nk"  # nk / ok / qk
+class Axis:
+    field: F
+    scope: str  # rows / cols
+    min: float | None = None
+    max: float | None = None
+    reverse: bool = False
+    title: str | None = None
+    hidden: bool = False
+    fmt: str | None = None  # number format of the tick labels
 
-    def instance(self) -> str:
-        return f"[{self.deriv}:{self.col}:{self.kind}]"
+
+@dataclass
+class RefLine:
+    field: F
+    value: float
+    label: str = ""
 
 
 @dataclass
@@ -91,392 +149,521 @@ class Sheet:
     cols: list[F] = field(default_factory=list)
     mark: str = "Automatic"
     color: F | None = None
+    color_range: tuple[float, float] | None = None  # continuous colour: red-blue diverging centred on 0
+    color_seq: str | None = None  # continuous colour: a sequential built-in palette, e.g. blue_10_0
+    line_step: bool = False
+    label_cull: bool = True
     size: F | None = None
+    shape: F | None = None
     label: list[F] = field(default_factory=list)
     detail: list[F] = field(default_factory=list)
     tooltip: list[F] = field(default_factory=list)
+    path: F | None = None
     aggregate: bool = True
-    # (field, kind, value): kind 'all' / 'member' (value = member) / 'min' (value = number)
-    filters: list[tuple[F, str, object]] = field(default_factory=list)
-    axes: list[tuple[F, str, float, float]] = field(default_factory=list)  # (field, rows/cols, min, max)
+    filters: list[tuple] = field(default_factory=list)  # ("true", F) / ("min", F, v) / ("member", F, v)
+    sorts: list[tuple[F, F, str, str]] = field(default_factory=list)  # (dimension, by, ASC/DESC, rows/columns)
+    axes: list[Axis] = field(default_factory=list)
+    reflines: list[RefLine] = field(default_factory=list)
+    formats: dict[str, str] = field(default_factory=dict)  # F.inst -> Tableau number format
+    title: list[tuple[str, dict]] | None = None  # runs: text, "<[usr:x:nk]>" field or "<Parameters.Takım>"
+    tooltip_runs: list[tuple[str, dict]] | None = None
+    mark_size: float | None = None
+    hide_headers: list[F] = field(default_factory=list)
+
+
+@dataclass
+class Zone:
+    kind: str  # sheet / text / param / legend / nav / blank
+    x: int
+    y: int
+    w: int
+    h: int
+    sheet: str | None = None
+    runs: list[tuple[str, dict]] | None = None
+    param: Param | None = None
+    mode: str = "compact"
+    target: str | None = None  # nav: dashboard name
+    legend_field: F | None = None
+    show_title: bool = True
+    fit: str = "entire-view"  # entire-view / fit-width / fit-height / standard
+    map_controls: bool = True  # zoom/pan toolbar on views with a background image
+    background: str | None = None
     title: str | None = None
 
 
+@dataclass
+class Dashboard:
+    name: str
+    zones: list[Zone]
+    width: int = 1200
+    height: int = 800
+
+
+@dataclass
+class ParamAction:
+    caption: str
+    dashboard: str
+    sheet: str
+    source: F  # a dimension on the sheet (on Detail)
+    param: Param
+
+
+# -- writer -----------------------------------------------------------------------------
 DATATYPES = {pl.Int8: "integer", pl.Int16: "integer", pl.Int32: "integer", pl.Int64: "integer", pl.UInt32: "integer",
              pl.UInt64: "integer", pl.Float32: "real", pl.Float64: "real", pl.Boolean: "boolean", pl.Date: "date",
              pl.String: "string"}
-
-
-def _read_columns(src: Source, directory: Path) -> None:
-    df = pl.read_csv(directory / src.file, n_rows=2000, try_parse_dates=True, infer_schema_length=2000)
-    src.columns = {c: DATATYPES.get(df.schema[c].base_type(), "string") for c in df.columns}
-
-
 HYPER_TYPES = {"string": ("TEXT", "129"), "integer": ("BIG_INT", "20"), "real": ("DOUBLE", "5"),
                "boolean": ("BOOL", "11"), "date": ("DATE", "133")}
 
 
-def _write_extract(src: Source, directory: Path) -> Path:
-    """CSV -> Hyper file with the table Tableau expects for an extract: "Extract"."Extract"."""
-    from tableauhyperapi import (Connection, CreateMode, HyperProcess, Inserter, SqlType, TableDefinition,
-                                 TableName, Telemetry)
+class Workbook:
+    def __init__(self, directory: Path, params: list[Param], sources: list[Source], sheets: list[Sheet],
+                 dashboards: list[Dashboard], actions: list[ParamAction], locale: str = "tr_TR",
+                 start: str | None = None):
+        self.dir = directory.resolve()
+        self.params, self.sources, self.sheets = params, sources, sheets
+        self.dashboards, self.actions, self.locale, self.start = dashboards, actions, locale, start
+        for i, p in enumerate(params, 1):
+            p.name = f"Parameter {i}"
+        self.by_caption = {p.caption: p for p in params}
+        for s in sources:
+            df = pl.read_csv(self.dir / s.file, n_rows=5000, try_parse_dates=True, infer_schema_length=5000)
+            s.columns = {c: DATATYPES.get(df.schema[c].base_type(), "string") for c in df.columns}
+            for c in s.calcs:
+                c.formula = self.resolve(c.formula)
 
-    path = directory / src.file.replace(".csv", ".hyper")
-    df = pl.read_csv(directory / src.file, try_parse_dates=True, infer_schema_length=None).select(list(src.columns))
-    table = TableDefinition(TableName("Extract", "Extract"), [
-        TableDefinition.Column(c, getattr(SqlType, HYPER_TYPES[dt][0].lower())()) for c, dt in src.columns.items()])
-    with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper, \
-            Connection(hyper.endpoint, path, CreateMode.CREATE_AND_REPLACE) as conn:
-        conn.catalog.create_schema("Extract")
-        conn.catalog.create_table(table)
-        with Inserter(conn, table) as ins:
-            ins.add_rows(df.iter_rows())
-            ins.execute()
-    return path
+    def resolve(self, formula: str) -> str:
+        """{Takım} -> [Parameters].[Parameter 1]."""
+        return re.sub(r"\{([^{}]+)\}", lambda m: self.by_caption[m.group(1)].ref if m.group(1) in self.by_caption
+                      else m.group(0), formula)
 
+    # parameters and data sources
+    def _param_columns(self, parent: ET.Element, only: set[str] | None = None) -> None:
+        for p in self.params:
+            if only is not None and p.name not in only:
+                continue
+            typ = "quantitative" if p.datatype in ("integer", "real") else "nominal"
+            domain = "range" if p.range else "list" if p.members else "any"
+            current = next((a for v, a in p.members if v == p.default and a), None)  # shown in the control
+            el = ET.SubElement(parent, "column", {**({"alias": current} if current else {}), "caption": p.caption,
+                                                  "datatype": p.datatype, "name": f"[{p.name}]",
+                                                  "param-domain-type": domain, "role": "measure", "type": typ,
+                                                  "value": _q(p.default)})
+            ET.SubElement(el, "calculation", {"class": "tableau", "formula": _q(p.default)})
+            if p.range:
+                ET.SubElement(el, "range", granularity=repr(p.range[2]), max=repr(p.range[1]), min=repr(p.range[0]))
+            elif p.members:
+                if any(a for _, a in p.members):
+                    al = ET.SubElement(el, "aliases")
+                    for v, a in p.members:
+                        if a:
+                            ET.SubElement(al, "alias", key=_q(v), value=a)
+                ms = ET.SubElement(el, "members")
+                for v, a in p.members:
+                    ET.SubElement(ms, "member", {**({"alias": a} if a else {}), "value": _q(v)})
 
-def _extract(src: Source, hyper: Path) -> ET.Element:
-    # object-id is required once the ObjectModelExtractV2 format flag is set (and rejected without it)
-    ex = ET.Element("extract", count="-1", enabled="true", units="records", **{"object-id": ""})
-    conn = ET.SubElement(ex, "connection", {
-        "access_mode": "readonly", "author-locale": "en_US", "class": "hyper", "dbname": str(hyper),
-        "default-settings": "hyper", "schema": "Extract", "sslmode": "", "tablename": "Extract",
-        "update-time": time.strftime("%m/%d/%Y %I:%M:%S %p"), "username": "tableau_internal_user"})
-    ET.SubElement(conn, "relation", name="Extract", table="[Extract].[Extract]", type="table")
-    recs = ET.SubElement(conn, "metadata-records")
-    for i, (c, dt) in enumerate(src.columns.items()):
-        r = ET.SubElement(recs, "metadata-record", {"class": "column"})
-        for tag, text in (("remote-name", c), ("remote-type", HYPER_TYPES[dt][1]), ("local-name", f"[{c}]"),
-                          ("parent-name", "[Extract]"), ("remote-alias", c), ("ordinal", str(i)),
-                          ("family", src.file), ("local-type", dt),
-                          ("aggregation", "Sum" if dt in ("integer", "real") else "Count"),
-                          ("contains-null", "true")):
-            ET.SubElement(r, tag).text = text
-    return ex
+    def _write_extract(self, s: Source) -> Path:
+        from tableauhyperapi import (Connection, CreateMode, HyperProcess, Inserter, SqlType, TableDefinition,
+                                     TableName, Telemetry)
 
+        path = self.dir / s.file.replace(".csv", ".hyper")
+        df = pl.read_csv(self.dir / s.file, try_parse_dates=True, infer_schema_length=None).select(list(s.columns))
+        table = TableDefinition(TableName("Extract", "Extract"), [
+            TableDefinition.Column(c, getattr(SqlType, HYPER_TYPES[dt][0].lower())()) for c, dt in s.columns.items()])
+        with HyperProcess(Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU, parameters={"log_dir": str(self.dir)}) as hyper, \
+                Connection(hyper.endpoint, path, CreateMode.CREATE_AND_REPLACE) as conn:
+            conn.catalog.create_schema("Extract")
+            conn.catalog.create_table(table)
+            with Inserter(conn, table) as ins:
+                ins.add_rows(df.iter_rows())
+                ins.execute()
+        return path
 
-def _datasource(src: Source, directory: Path, hyper: Path) -> ET.Element:
-    table = src.file.replace(".csv", "#csv")
-    conn_name = "textscan." + _id("conn", src.file)
-    ds = ET.Element("datasource", caption=src.caption, inline="true", name=src.name, version=VERSION)
-    fed = ET.SubElement(ds, "connection", {"class": "federated"})
-    named = ET.SubElement(ET.SubElement(fed, "named-connections"), "named-connection", caption=src.caption, name=conn_name)
-    ET.SubElement(named, "connection", {"class": "textscan", "directory": str(directory), "filename": src.file,
-                                        "server": "", "workgroup-auth-mode": "as-is"})
+    def _datasource(self, s: Source) -> ET.Element:
+        table = s.file.replace(".csv", "#csv")
+        conn_name = "textscan." + _id("conn", s.file)
+        ds = ET.Element("datasource", caption=s.caption, inline="true", name=s.name, version=VERSION)
+        fed = ET.SubElement(ds, "connection", {"class": "federated"})
+        named = ET.SubElement(ET.SubElement(fed, "named-connections"), "named-connection", caption=s.caption,
+                              name=conn_name)
+        ET.SubElement(named, "connection", {"class": "textscan", "directory": str(self.dir), "filename": s.file,
+                                            "server": "", "workgroup-auth-mode": "as-is"})
 
-    def relation(parent, with_conn=True):
-        attrs = {"name": src.file, "table": f"[{table}]", "type": "table"}
-        if with_conn:
-            attrs = {"connection": conn_name, **attrs}
-        rel = ET.SubElement(parent, "relation", attrs)
-        cols = ET.SubElement(rel, "columns", {"character-set": "UTF-8", "header": "yes", "locale": "en", "separator": ","})
-        for i, (c, dt) in enumerate(src.columns.items()):
-            ET.SubElement(cols, "column", datatype=dt, name=c, ordinal=str(i))
-        return rel
+        def relation(parent, with_conn=True):
+            attrs = {"name": s.file, "table": f"[{table}]", "type": "table"}
+            rel = ET.SubElement(parent, "relation", {"connection": conn_name, **attrs} if with_conn else attrs)
+            cols = ET.SubElement(rel, "columns", {"character-set": "UTF-8", "header": "yes", "locale": "en",
+                                                  "separator": ","})
+            for i, (c, dt) in enumerate(s.columns.items()):
+                ET.SubElement(cols, "column", datatype=dt, name=c, ordinal=str(i))
 
-    relation(fed)
-    ET.SubElement(ds, "aliases", enabled="yes")
-    for c in src.calcs:
-        el = ET.SubElement(ds, "column", caption=c.caption, datatype=c.datatype, name=f"[{c.name}]", role=c.role,
-                           type=c.type)
-        ET.SubElement(el, "calculation", {"class": "tableau", "formula": c.formula})
-    for c in src.columns:
-        dt, role, typ = src.kind(c)
-        ET.SubElement(ds, "column", datatype=dt, name=f"[{c}]", role=role, type=typ)
-    ds.append(_extract(src, hyper))
-    ET.SubElement(ds, "layout", {"dim-ordering": "alphabetic", "measure-ordering": "alphabetic", "show-structure": "true"})
-    obj = ET.SubElement(ET.SubElement(ET.SubElement(ds, "object-graph"), "objects"), "object",
-                        caption=src.file, id=f"{src.file}_{_id('obj', src.file, n=32).upper()}")
-    relation(ET.SubElement(obj, "properties", context=""))
-    ET.SubElement(ET.SubElement(obj, "properties", context="extract"), "relation", name="Extract",
-                  table="[Extract].[Extract]", type="table")
-    return ds
+        relation(fed)
+        ET.SubElement(ds, "aliases", enabled="yes")
+        for c in s.calcs:
+            el = ET.SubElement(ds, "column", caption=c.caption, datatype=c.datatype, name=f"[{c.name}]", role=c.role,
+                               type=c.type)
+            ET.SubElement(el, "calculation", {"class": "tableau", "formula": c.formula})
+        for c in s.columns:
+            dt, role, typ = s.kind(c)
+            ET.SubElement(ds, "column", {**({"caption": s.captions[c]} if c in s.captions else {}), "datatype": dt,
+                                         "name": f"[{c}]", "role": role, "type": typ})
+        for key in s.colors:  # a [none:x:nk] colour key needs its column instance declared here
+            if key.startswith("[none:"):
+                col = key[6:-4]
+                ET.SubElement(ds, "column-instance", column=f"[{col}]", derivation="None", name=key, pivot="key",
+                              type="nominal")
+        if s.image:
+            img, xc, yc, (left, right, bottom, top) = s.image
+            mi = ET.SubElement(ET.SubElement(ds, "mapped-images"), "mapped-image", caption=Path(img).stem,
+                               expression=(self.dir / img).as_uri(), name="[MappedImage1]")
+            ET.SubElement(mi, "mapping", bottom=repr(bottom), left=repr(left), right=repr(right), top=repr(top),
+                          x=f"[{xc}]", y=f"[{yc}]")
+            ET.SubElement(mi, "image-options", **{"show-entire-image": "true"})
+        ds.append(self._extract(s, self._write_extract(s)))
+        ET.SubElement(ds, "layout", {"dim-ordering": "alphabetic", "measure-ordering": "alphabetic",
+                                     "show-structure": "true"})
+        if s.colors:
+            rule = ET.SubElement(ET.SubElement(ds, "style"), "style-rule", element="mark")
+            for fld, mapping in s.colors.items():
+                enc = ET.SubElement(rule, "encoding", attr="color", type="palette",
+                                    field=fld if fld.startswith("[") else f"[{fld}]")
+                for v, hexv in mapping.items():
+                    ET.SubElement(ET.SubElement(enc, "map", to=hexv), "bucket").text = _q(v)
+        obj = ET.SubElement(ET.SubElement(ET.SubElement(ds, "object-graph"), "objects"), "object",
+                            caption=s.file, id=f"{s.file}_{_id('obj', s.file, n=32).upper()}")
+        relation(ET.SubElement(obj, "properties", context=""), with_conn=True)
+        ET.SubElement(ET.SubElement(obj, "properties", context="extract"), "relation", name="Extract",
+                      table="[Extract].[Extract]", type="table")
+        return ds
 
+    def _extract(self, s: Source, hyper: Path) -> ET.Element:
+        # object-id is required once the ObjectModelExtractV2 format flag is set
+        ex = ET.Element("extract", count="-1", enabled="true", units="records", **{"object-id": ""})
+        conn = ET.SubElement(ex, "connection", {
+            "access_mode": "readonly", "author-locale": "en_US", "class": "hyper", "dbname": str(hyper),
+            "default-settings": "hyper", "schema": "Extract", "sslmode": "", "tablename": "Extract",
+            "update-time": time.strftime("%m/%d/%Y %I:%M:%S %p"), "username": "tableau_internal_user"})
+        ET.SubElement(conn, "relation", name="Extract", table="[Extract].[Extract]", type="table")
+        recs = ET.SubElement(conn, "metadata-records")
+        for i, (c, dt) in enumerate(s.columns.items()):
+            r = ET.SubElement(recs, "metadata-record", {"class": "column"})
+            for tag, text in (("remote-name", c), ("remote-type", HYPER_TYPES[dt][1]), ("local-name", f"[{c}]"),
+                              ("parent-name", "[Extract]"), ("remote-alias", c), ("ordinal", str(i)),
+                              ("family", s.file), ("local-type", dt),
+                              ("aggregation", "Sum" if dt in ("integer", "real") else "Count"),
+                              ("contains-null", "true")):
+                ET.SubElement(r, tag).text = text
+        return ex
 
-def _worksheet(sh: Sheet) -> ET.Element:
-    src, dsn = sh.source, sh.source.name
-    q = lambda f: f"[{dsn}].{f.instance()}"  # noqa: E731
-    ws = ET.Element("worksheet", name=sh.name)
-    if sh.title:
-        layout = ET.SubElement(ws, "layout-options")
-        title = ET.SubElement(ET.SubElement(layout, "title"), "formatted-text")
-        ET.SubElement(title, "run").text = sh.title
-    table = ET.SubElement(ws, "table")
-    view = ET.SubElement(table, "view")
-    ET.SubElement(ET.SubElement(view, "datasources"), "datasource", caption=src.caption, name=dsn)
-    deps = ET.SubElement(view, "datasource-dependencies", datasource=dsn)
-    used = [*sh.rows, *sh.cols, *(x for x in (sh.color, sh.size) if x), *sh.label, *sh.detail, *sh.tooltip,
-            *(f for f, _, _ in sh.filters)]
-    seen_cols, seen_inst = set(), set()
-    for f in used:
-        if f.col not in seen_cols:
-            seen_cols.add(f.col)
-            dt, role, typ = src.kind(f.col)
-            el = ET.SubElement(deps, "column", datatype=dt, name=f"[{f.col}]", role=role, type=typ)
-            calc = next((c for c in src.calcs if c.name == f.col), None)
-            if calc:
-                el.set("caption", calc.caption)
-                ET.SubElement(el, "calculation", {"class": "tableau", "formula": calc.formula})
-    for f in used:
-        if f.instance() not in seen_inst:
-            seen_inst.add(f.instance())
-            deriv = {"none": "None", "sum": "Sum", "avg": "Avg", "cnt": "Count", "usr": "User", "max": "Max",
-                     "attr": "Attribute"}[f.deriv]
-            ET.SubElement(deps, "column-instance", column=f"[{f.col}]", derivation=deriv, name=f.instance(),
-                          pivot="key", type={"nk": "nominal", "ok": "ordinal", "qk": "quantitative"}[f.kind])
-    for f, kind, value in sh.filters:
-        if kind == "min":
-            flt = ET.SubElement(view, "filter", {"class": "quantitative", "column": q(f), "included-values": "in-range"})
-            ET.SubElement(flt, "min").text = str(value)
-        else:
-            flt = ET.SubElement(view, "filter", {"class": "categorical", "column": q(f)})
-            if kind == "all":
-                ET.SubElement(flt, "groupfilter", {"function": "level-members", "level": f.instance(),
-                                                   U + "ui-enumeration": "all", U + "ui-marker": "enumerate"})
+    # worksheets
+    def _ref(self, s: Source, f: F) -> str:
+        return f"[{s.name}].{f.inst}"
+
+    def _runs(self, parent: ET.Element, runs: list[tuple[str, dict]], src: Source | None) -> None:
+        ft = ET.SubElement(parent, "formatted-text")
+        for text, style in runs:
+            if text.startswith("<Parameters."):
+                text = f"<{self.by_caption[text[12:-1]].ref}>"
+            elif text.startswith("<[") and src is not None:
+                text = f"<[{src.name}].{text[1:-1]}>"
+            ET.SubElement(ft, "run", {k: str(v) for k, v in style.items()}).text = text
+
+    def _used_calcs(self, s: Source, names: set[str]) -> list[Calc]:
+        """Calcs used on the sheet plus the calcs they reference, transitively."""
+        out, todo = [], list(names)
+        while todo:
+            c = s.calc(todo.pop())
+            if c and c not in out:
+                out.append(c)
+                todo += re.findall(r"\[(Calculation_[^\]]+)\]", c.formula)
+        return out
+
+    def _worksheet(self, sh: Sheet) -> ET.Element:
+        s = sh.source
+        # Tableau only shows a dimension in a tooltip as ATTR(): convert, and point the tooltip text at it
+        conv = {f.inst: F(f.col, "attr", f.kind) for f in sh.tooltip if f.deriv == "none" and f.kind in ("nk", "ok")}
+        if conv:
+            sh.tooltip = [conv.get(f.inst, f) for f in sh.tooltip]
+            sh.tooltip_runs = [(f"<{conv[t[1:-1]].inst}>" if t.startswith("<[") and t[1:-1] in conv else t, st)
+                               for t, st in (sh.tooltip_runs or [])]
+        ws = ET.Element("worksheet", name=sh.name)
+        if sh.title:
+            self._runs(ET.SubElement(ET.SubElement(ws, "layout-options"), "title"), sh.title, s)
+        table = ET.SubElement(ws, "table")
+        view = ET.SubElement(table, "view")
+        dss = ET.SubElement(view, "datasources")
+        used = [*sh.rows, *sh.cols, *(x for x in (sh.color, sh.size, sh.shape, sh.path) if x), *sh.label, *sh.detail,
+                *sh.tooltip, *(f[1] for f in sh.filters), *(x for st in sh.sorts for x in st[:2])]
+        pnames = set()
+        for runs in (sh.title or [], sh.tooltip_runs or []):
+            for text, _ in runs:
+                m = re.fullmatch(r"<\[(\w+):([^:\]]+):(\w+)\]>", text)
+                if m:
+                    used.append(F(m.group(2), m.group(1), m.group(3)))
+                if text.startswith("<Parameters."):
+                    pnames.add(self.by_caption[text[12:-1]].name)
+        calcs = self._used_calcs(s, {f.col for f in used})
+        pnames |= {m for c in calcs for m in re.findall(r"\[Parameters\]\.\[([^\]]+)\]", c.formula)}
+        ET.SubElement(dss, "datasource", caption=s.caption, name=s.name)  # the sheet's own source first
+        if pnames:
+            ET.SubElement(dss, "datasource", name="Parameters")
+        if pnames:
+            self._param_columns(ET.SubElement(view, "datasource-dependencies", datasource="Parameters"), pnames)
+        deps = ET.SubElement(view, "datasource-dependencies", datasource=s.name)
+        base = {f.col for f in used if not s.calc(f.col)} | {
+            b for c in calcs for b in re.findall(r"(?<!\]\.)\[([^\[\]]+)\]", c.formula) if b in s.columns}
+        for c in calcs:
+            el = ET.SubElement(deps, "column", caption=c.caption, datatype=c.datatype, name=f"[{c.name}]",
+                               role=c.role, type=c.type)
+            ET.SubElement(el, "calculation", {"class": "tableau", "formula": c.formula})
+        for col in sorted(base):
+            dt, role, typ = s.kind(col)
+            ET.SubElement(deps, "column", {**({"caption": s.captions[col]} if col in s.captions else {}),
+                                           "datatype": dt, "name": f"[{col}]", "role": role, "type": typ})
+        seen = set()
+        for f in used:
+            if f.inst not in seen:
+                seen.add(f.inst)
+                ET.SubElement(deps, "column-instance", column=f"[{f.col}]", derivation=DERIV[f.deriv], name=f.inst,
+                              pivot="key", type=KIND[f.kind])
+        for flt in sh.filters:
+            kind, f = flt[0], flt[1]
+            if kind == "min":
+                el = ET.SubElement(view, "filter", {"class": "quantitative", "column": self._ref(s, f),
+                                                    "included-values": "in-range"})
+                ET.SubElement(el, "min").text = repr(flt[2])
             else:
-                ET.SubElement(flt, "groupfilter", {"function": "member", "level": f.instance(),
-                                                   "member": value if value in ("true", "false") else f'"{value}"',
-                                                   U + "ui-domain": "database", U + "ui-enumeration": "inclusive",
-                                                   U + "ui-marker": "enumerate"})
-    ET.SubElement(view, "aggregation", value="true" if sh.aggregate else "false")
-    style = ET.SubElement(table, "style")
-    if sh.axes:
-        rule = ET.SubElement(style, "style-rule", element="axis")
-        for f, scope, lo, hi in sh.axes:
-            ET.SubElement(rule, "encoding", {"attr": "space", "class": "0", "field": q(f), "field-type": "quantitative",
-                                             "max": str(hi), "min": str(lo), "range-type": "fixed", "scope": scope,
-                                             "type": "space"})
-    pane = ET.SubElement(ET.SubElement(table, "panes"), "pane", {"selection-relaxation-option": "selection-relaxation-allow"})
-    ET.SubElement(ET.SubElement(pane, "view"), "breakdown", value="auto")
-    ET.SubElement(pane, "mark", {"class": sh.mark})
-    enc = ET.SubElement(pane, "encodings")
-    if sh.color:
-        ET.SubElement(enc, "color", column=q(sh.color))
-    if sh.size:
-        ET.SubElement(enc, "size", column=q(sh.size))
-    for f in sh.label:
-        ET.SubElement(enc, "text", column=q(f))
-    for f in sh.detail:
-        ET.SubElement(enc, "lod", column=q(f))
-    for f in sh.tooltip:
-        ET.SubElement(enc, "tooltip", column=q(f))
-    if sh.label:
-        ET.SubElement(ET.SubElement(ET.SubElement(pane, "style"), "style-rule", element="mark"), "format",
-                      attr="mark-labels-show", value="true")
-    ET.SubElement(table, "rows").text = " / ".join(q(f) for f in sh.rows) if len(sh.rows) < 2 else \
-        "(" + " / ".join(q(f) for f in sh.rows) + ")"
-    ET.SubElement(table, "cols").text = " / ".join(q(f) for f in sh.cols) if len(sh.cols) < 2 else \
-        "(" + " / ".join(q(f) for f in sh.cols) + ")"
-    ET.SubElement(ws, "simple-id", uuid=_uuid("ws", sh.name))
-    return ws
+                value = "true" if kind == "true" else _q(flt[2])
+                el = ET.SubElement(view, "filter", {"class": "categorical", "column": self._ref(s, f)})
+                ET.SubElement(el, "groupfilter", {"function": "member", "level": f.inst, "member": value,
+                                                  U + "ui-domain": "database", U + "ui-enumeration": "inclusive",
+                                                  U + "ui-marker": "enumerate"})
+        if sh.sorts:
+            ss = ET.SubElement(view, "shelf-sorts")
+            for dim, by, direction, shelf in sh.sorts:
+                ET.SubElement(ss, "shelf-sort-v2", {"dimension-to-sort": self._ref(s, dim), "direction": direction,
+                                                    "is-on-innermost-dimension": "true",
+                                                    "measure-to-sort-by": self._ref(s, by), "shelf": shelf})
+        ET.SubElement(view, "aggregation", value="true" if sh.aggregate else "false")
 
+        style = ET.SubElement(table, "style")
+        if sh.axes:
+            rule = ET.SubElement(style, "style-rule", element="axis")
+            for a in sh.axes:
+                attrs = {"attr": "space", "class": "0", "field": self._ref(s, a.field), "field-type": "quantitative"}
+                if a.min is not None:
+                    attrs.update({"max": repr(a.max), "min": repr(a.min), "range-type": "fixed"})
+                if a.reverse:
+                    attrs["reverse"] = "true"
+                ET.SubElement(rule, "encoding", {**attrs, "scope": a.scope, "type": "space"})
+            for a in sh.axes:
+                if a.title is not None:
+                    ET.SubElement(rule, "format", {"attr": "title", "class": "0", "field": self._ref(s, a.field),
+                                                   "scope": a.scope, "value": a.title})
+                if a.hidden:
+                    ET.SubElement(rule, "format", {"attr": "display", "class": "0", "field": self._ref(s, a.field),
+                                                   "scope": a.scope, "value": "false"})
+                if a.fmt:
+                    ET.SubElement(rule, "format", {"attr": "text-format", "field": self._ref(s, a.field), "value": a.fmt})
+        rule = ET.SubElement(style, "style-rule", element="worksheet")
+        ET.SubElement(rule, "format", attr="display-field-labels", scope="rows", value="false")
+        ET.SubElement(rule, "format", attr="display-field-labels", scope="cols", value="false")
+        if sh.hide_headers:
+            rule = ET.SubElement(style, "style-rule", element="header")
+            for f in sh.hide_headers:
+                ET.SubElement(rule, "format", {"attr": "display", "field": self._ref(s, f), "value": "false"})
+        if sh.formats:
+            for element in ("cell", "label", "tooltip"):
+                rule = ET.SubElement(style, "style-rule", element=element)
+                for inst, fmt in sh.formats.items():
+                    ET.SubElement(rule, "format", {"attr": "text-format", "field": f"[{s.name}].{inst}", "value": fmt})
+        if sh.color is not None and sh.color_range is not None:
+            lo, hi = sh.color_range
+            ET.SubElement(ET.SubElement(style, "style-rule", element="mark"), "encoding", {
+                "attr": "color", "center": "0.0", "field": self._ref(s, sh.color), "max": repr(hi), "min": repr(lo),
+                "palette": "red_blue_diverging_10_0", "type": "interpolated"})
+        elif sh.color is not None and sh.color_seq:
+            ET.SubElement(ET.SubElement(style, "style-rule", element="mark"), "encoding", {
+                "attr": "color", "field": self._ref(s, sh.color), "palette": sh.color_seq, "type": "interpolated"})
 
-def _window_ws(sh: Sheet) -> ET.Element:
-    w = ET.Element("window", {"class": "worksheet", "name": sh.name})
-    cards = ET.SubElement(w, "cards")
-    left = ET.SubElement(ET.SubElement(cards, "edge", name="left"), "strip", size="160")
-    for t in ("pages", "filters", "marks"):
-        ET.SubElement(left, "card", type=t)
-    top = ET.SubElement(cards, "edge", name="top")
-    for t, size in (("columns", "2147483647"), ("rows", "2147483647"), ("title", "31")):
-        ET.SubElement(ET.SubElement(top, "strip", size=size), "card", type=t)
-    shown = [(f, k) for f, k, _ in sh.filters if k != "min"]
-    if shown or sh.color:
-        right = ET.SubElement(ET.SubElement(cards, "edge", name="right"), "strip", size="160")
-        for f, k in shown:
-            ET.SubElement(right, "card", {"column": f"[{sh.source.name}].{f.instance()}", "type": "filter",
-                                          **({"mode": "dropdown"} if k == "member" else {})})
-        if sh.color:
-            ET.SubElement(right, "card", {"pane-specification-id": "0", "param": f"[{sh.source.name}].{sh.color.instance()}",
-                                          "type": "color"})
-    ET.SubElement(w, "simple-id", uuid=_uuid("win", sh.name))
-    return w
+        pane = ET.SubElement(ET.SubElement(table, "panes"), "pane",
+                             {"selection-relaxation-option": "selection-relaxation-allow"})
+        ET.SubElement(ET.SubElement(pane, "view"), "breakdown", value="auto")
+        ET.SubElement(pane, "mark", {"class": sh.mark})
+        enc = ET.SubElement(pane, "encodings")
+        for tag, f in (("color", sh.color), ("size", sh.size), ("shape", sh.shape), ("path", sh.path)):
+            if f is not None:
+                ET.SubElement(enc, tag, column=self._ref(s, f))
+        for tag, fs in (("text", sh.label), ("lod", sh.detail), ("tooltip", sh.tooltip)):
+            for f in fs:
+                ET.SubElement(enc, tag, column=self._ref(s, f))
+        for i, r in enumerate(sh.reflines):
+            ET.SubElement(pane, "reference-line", {
+                "axis-column": self._ref(s, r.field), "enable-instant-analytics": "true", "formula": "constant",
+                "id": f"refline{i}", "label": r.label, "label-type": "custom" if r.label else "none",
+                "scope": "per-pane", "value": repr(r.value), "value-column": self._ref(s, r.field),
+                "z-order": str(i + 1)})
+        if sh.tooltip_runs:
+            self._runs(ET.SubElement(pane, "customized-tooltip", {"show-buttons": "false"}), sh.tooltip_runs, s)
+        mrule = ET.SubElement(ET.SubElement(pane, "style"), "style-rule", element="mark")
+        if sh.label:
+            ET.SubElement(mrule, "format", attr="mark-labels-show", value="true")
+            ET.SubElement(mrule, "format", attr="mark-labels-cull", value="true" if sh.label_cull else "false")
+        if sh.line_step:
+            ET.SubElement(mrule, "format", attr="line-interpolation", value="step")
+        if sh.mark_size is not None:
+            ET.SubElement(mrule, "format", attr="size", value=repr(sh.mark_size))
 
+        def shelf(fs: list[F]) -> str | None:
+            if not fs:
+                return None
+            refs = " / ".join(self._ref(s, f) for f in fs)
+            return refs if len(fs) == 1 else f"({refs})"
 
-def _dashboard(name: str, title: str, zones: list[tuple[str, int, int, int, int]],
-               filters: list[tuple[Sheet, F, int, int, int, int, bool]]) -> tuple[ET.Element, ET.Element]:
-    """zones: (sheet name, x, y, w, h) in 0-100000 units; filters: (sheet, field, x, y, w, h, single)."""
-    d = ET.Element("dashboard", name=name)
-    ET.SubElement(d, "style")
-    ET.SubElement(d, "size", maxheight="900", maxwidth="1400", minheight="900", minwidth="1400", **{"sizing-mode": "fixed"})
-    root = ET.SubElement(ET.SubElement(d, "zones"), "zone", h="100000", id="1", w="100000", x="0", y="0",
-                         **{"type-v2": "layout-basic"})
-    zid = 2
-    t = ET.SubElement(root, "zone", h="6000", id=str(zid), w="98000", x="1000", y="1000", floating="true",
-                      **{"type-v2": "text"})
-    run = ET.SubElement(ET.SubElement(t, "formatted-text"), "run", {"fontsize": "18", "bold": "true"})
-    run.text = title
-    for sheet, x, y, w, h in zones:
-        zid += 1
-        ET.SubElement(root, "zone", h=str(h), id=str(zid), name=sheet, w=str(w), x=str(x), y=str(y), floating="true")
-    for sh, f, x, y, w, h, single in filters:
-        zid += 1
-        ET.SubElement(root, "zone", {"h": str(h), "id": str(zid), "name": sh.name, "w": str(w), "x": str(x),
-                                     "y": str(y), "floating": "true", "type-v2": "filter",
-                                     "param": f"[{sh.source.name}].{f.instance()}",
-                                     **({"mode": "dropdown"} if single else {"mode": "checkdropdown"})})
-    ET.SubElement(d, "simple-id", uuid=_uuid("db", name))
-    win = ET.Element("window", {"class": "dashboard", "maximized": "true", "name": name})
-    vps = ET.SubElement(win, "viewpoints")
-    for sheet, *_ in zones:
-        ET.SubElement(vps, "viewpoint", name=sheet)
-    ET.SubElement(win, "active", id="-1")
-    ET.SubElement(win, "simple-id", uuid=_uuid("dbwin", name))
-    return d, win
+        ET.SubElement(table, "rows").text = shelf(sh.rows)
+        ET.SubElement(table, "cols").text = shelf(sh.cols)
+        ET.SubElement(ws, "simple-id", uuid=_uuid("ws", sh.name))
+        return ws
+
+    # dashboards
+    def _dashboard(self, d: Dashboard) -> ET.Element:
+        el = ET.Element("dashboard", name=d.name)
+        dstyle = ET.SubElement(el, "style")
+        texts = [i for i, z in enumerate(d.zones, 2) if z.kind == "text"]
+        if texts:  # text objects start at the top of their box
+            rule = ET.SubElement(dstyle, "style-rule", element="dash-text")
+            for i in texts:
+                ET.SubElement(rule, "format", attr="vertical-align", id=f"dash-text_{i}", value="top")
+        ET.SubElement(el, "size", maxheight=str(d.height), maxwidth=str(d.width), minheight=str(d.height),
+                      minwidth=str(d.width), **{"sizing-mode": "fixed"})
+        controls = {z.param.name for z in d.zones if z.kind == "param"}
+        if controls:  # a dashboard with parameter controls lists the parameters it shows
+            ET.SubElement(ET.SubElement(el, "datasources"), "datasource", name="Parameters")
+            self._param_columns(ET.SubElement(el, "datasource-dependencies", datasource="Parameters"), controls)
+        # a tiled root, then every object floating: floating zones are further children of <zones>
+        root = ET.SubElement(el, "zones")
+        ET.SubElement(root, "zone", h="100000", id="1", w="100000", x="0", y="0", **{"type-v2": "layout-basic"})
+        sx, sy = 100000 / d.width, 100000 / d.height
+        sheets = {s.name: s for s in self.sheets}
+        for i, z in enumerate(d.zones, 2):
+            geo = {"h": str(round(z.h * sy)), "id": str(i), "w": str(round(z.w * sx)), "x": str(round(z.x * sx)),
+                   "y": str(round(z.y * sy))}
+            if z.kind == "sheet":
+                zone = ET.SubElement(root, "zone", {**geo, "name": z.sheet,
+                                                    **({} if z.show_title else {"show-title": "false"})})
+            elif z.kind == "text":
+                zone = ET.SubElement(root, "zone", {**geo, "type-v2": "text"})
+                self._runs(zone, z.runs or [], None)
+            elif z.kind == "param":
+                zone = ET.SubElement(root, "zone", {**geo, "mode": z.mode, "param": z.param.ref, "type-v2": "paramctrl"})
+            elif z.kind == "legend":
+                src = sheets[z.sheet].source
+                zone = ET.SubElement(root, "zone", {**geo, "name": z.sheet, "pane-specification-id": "0",
+                                                    "param": self._ref(src, z.legend_field), "type-v2": "color"})
+            elif z.kind == "nav":
+                zone = ET.SubElement(root, "zone", {**geo, "type-v2": "dashboard-object"})
+                current = z.target == d.name
+                btn = ET.SubElement(zone, "button", {
+                    "action": f'tabdoc:goto-sheet window-id="{_uuid("dbwin", z.target)}"', "button-type": "text"})
+                vs = ET.SubElement(btn, "button-visual-state")
+                ET.SubElement(vs, "caption").text = z.title or z.target
+                ET.SubElement(vs, "button-caption-font-style", fontcolor="#ffffff" if current else "#1b2430",
+                              fontname="Tableau Medium", fontsize="9")
+                ET.SubElement(vs, "format", attr="background-color", value="#1b2430" if current else "#eef1f4")
+            else:  # blank
+                zone = ET.SubElement(root, "zone", {**geo, "type-v2": "empty"})
+            zs = ET.SubElement(zone, "zone-style")
+            ET.SubElement(zs, "format", attr="border-color", value="#000000")
+            ET.SubElement(zs, "format", attr="border-style", value="none")
+            ET.SubElement(zs, "format", attr="border-width", value="0")
+            ET.SubElement(zs, "format", attr="margin", value="4" if z.kind in ("sheet", "param", "legend") else "0")
+            if z.background:
+                ET.SubElement(zs, "format", attr="background-color", value=z.background)
+        ET.SubElement(el, "simple-id", uuid=_uuid("db", d.name))
+        return el
+
+    def _actions(self) -> ET.Element:
+        acts = ET.Element("actions")
+        for a in self.actions:
+            sheet = next(s for s in self.sheets if s.name == a.sheet)
+            el = ET.SubElement(acts, "edit-parameter-action", caption=a.caption,
+                               name=f"[Action_{_id('act', a.caption, a.dashboard, a.sheet, a.param.caption, n=32).upper()}]")
+            ET.SubElement(el, "activation", type="on-select")
+            ET.SubElement(el, "source", dashboard=a.dashboard, type="sheet", worksheet=a.sheet)
+            ET.SubElement(el, "agg-type", type="attr")
+            ET.SubElement(el, "clear-option", type="do-nothing", value="s:LROOT:")
+            ps = ET.SubElement(el, "params")
+            ET.SubElement(ps, "param", name="source-field", value=self._ref(sheet.source, a.source))
+            ET.SubElement(ps, "param", name="target-parameter", value=a.param.ref)
+        return acts
+
+    def _windows(self) -> ET.Element:
+        wins = ET.Element("windows", {"source-height": "30"})
+        for sh in self.sheets:
+            w = ET.SubElement(wins, "window", {"class": "worksheet", "hidden": "true", "name": sh.name})
+            cards = ET.SubElement(w, "cards")
+            left = ET.SubElement(ET.SubElement(cards, "edge", name="left"), "strip", size="160")
+            for t in ("pages", "filters", "marks"):
+                ET.SubElement(left, "card", type=t)
+            top = ET.SubElement(cards, "edge", name="top")
+            for t, size in (("columns", "2147483647"), ("rows", "2147483647"), ("title", "31")):
+                ET.SubElement(ET.SubElement(top, "strip", size=size), "card", type=t)
+            ET.SubElement(w, "simple-id", uuid=_uuid("win", sh.name))
+        for d in self.dashboards:
+            w = ET.SubElement(wins, "window", {"class": "dashboard",
+                                               **({"maximized": "true"} if d.name == self.start else {}), "name": d.name})
+            vps = ET.SubElement(w, "viewpoints")
+            for z in d.zones:
+                if z.kind == "sheet":
+                    vp = ET.SubElement(vps, "viewpoint", name=z.sheet)
+                    if z.fit != "standard":
+                        ET.SubElement(vp, "zoom", type=z.fit)
+                    if not z.map_controls:
+                        ET.SubElement(vp, "geo-search-visibility", value="0")
+                        ET.SubElement(vp, "map-navigation", value="0")
+            ET.SubElement(w, "active", id="-1")
+            ET.SubElement(w, "simple-id", uuid=_uuid("dbwin", d.name))
+        return wins
+
+    def write(self, path: Path) -> None:
+        wb = ET.Element("workbook", {"locale": self.locale, "original-version": VERSION, "source-build": BUILD,
+                                     "source-platform": "mac", "version": VERSION})
+        manifest = ET.SubElement(wb, "document-format-change-manifest")
+        for tag in ("AnimationOnByDefault", "BasicButtonObject", "BasicButtonObjectTextSupport", "IntuitiveSorting", "IntuitiveSorting_SP2", "MarkAnimation", "NavigationAction",
+                    "ObjectModelEncapsulateLegacy", "ObjectModelExtractV2", "ObjectModelTableType",
+                    "ParameterAction", "ParameterActionClearSelection", "SchemaViewerObjectModel", "SheetIdentifierTracking",
+                    "WindowsPersistSimpleIdentifiers"):
+            ET.SubElement(manifest, tag)
+        prefs = ET.SubElement(wb, "preferences")
+        ET.SubElement(prefs, "preference", name="ui.encoding.shelf.height", value="24")
+        ET.SubElement(prefs, "preference", name="ui.shelf.height", value="26")
+        rule = ET.SubElement(ET.SubElement(wb, "style"), "style-rule", element="all")
+        ET.SubElement(rule, "format", attr="font-family", value="Tableau Book")
+        dss = ET.SubElement(wb, "datasources")
+        if self.params:
+            pds = ET.SubElement(dss, "datasource", hasconnection="false", inline="true", name="Parameters",
+                                version=VERSION)
+            ET.SubElement(pds, "aliases", enabled="yes")
+            self._param_columns(pds)
+        for s in self.sources:
+            dss.append(self._datasource(s))
+        if self.actions:
+            wb.append(self._actions())
+        wss = ET.SubElement(wb, "worksheets")
+        for sh in self.sheets:
+            wss.append(self._worksheet(sh))
+        dbs = ET.SubElement(wb, "dashboards")
+        for d in self.dashboards:
+            dbs.append(self._dashboard(d))
+        wb.append(self._windows())
+        tree = ET.ElementTree(wb)
+        ET.indent(tree, "  ")
+        with open(path, "wb") as fh:
+            fh.write(b"<?xml version='1.0' encoding='utf-8' ?>\n\n")
+            tree.write(fh, encoding="utf-8", xml_declaration=False)
 
 
 def build_workbook(directory: Path, path: Path) -> None:
-    directory = directory.resolve()
-    shots = Source("shots.csv", "Şutlar", dimensions=("match_id", "week", "plot_x", "plot_y", "xfg"), calcs=[
-        Calc("hexx", "Hex X", "HEXBINX([plot_x] / 0.6, [plot_y] / 0.6) * 0.6", "real", "dimension", "quantitative"),
-        Calc("hexy", "Hex Y", "HEXBINY([plot_x] / 0.6, [plot_y] / 0.6) * 0.6", "real", "dimension", "quantitative"),
-        Calc("poe", "POE / şut", "(SUM([pts]) - SUM([xpts])) / COUNT([pts])", "real", "measure", "quantitative"),
-        Calc("n", "Şut sayısı", "COUNT([pts])", "integer", "measure", "quantitative"),
-        Calc("result", "Sonuç", 'IF [made] THEN "İsabet" ELSE "Kaçan" END', "string", "dimension", "nominal"),
-    ])
-    players = Source("player_shooting.csv", "Oyuncu şut", dimensions=("team_season_id", "player_id"))
-    teams = Source("team_shooting.csv", "Takım şut", dimensions=("team_season_id",))
-    pairs = Source("pairs.csv", "İkililer", dimensions=("team_season_id", "player_a_id", "player_b_id"))
-    assists = Source("assist_pairs.csv", "Asist ağı", dimensions=("team_season_id", "passer_id", "scorer_id"))
-    timeline = Source("score_timeline.csv", "Skor akışı",
-                      dimensions=("match_id", "seq", "action_number", "period_ord", "team_season_id", "player_id",
-                                  "week", "home_id", "away_id", "minute", "elapsed_s", "margin_home", "home_score",
-                                  "away_score"),
-                      calcs=[Calc("match", "Maç", 'STR([date]) + "  " + [home] + " - " + [away]', "string",
-                                  "dimension", "nominal")])
-    flow = Source("game_flow.csv", "Maç özeti", dimensions=("match_id", "team_season_id", "opponent_id", "week"),
-                  calcs=[Calc("game", "Maç (takım)", 'STR([date]) + "  " + [team] + " - " + [opponent]', "string",
-                              "dimension", "nominal")])
-    clutch = Source("clutch_team.csv", "Clutch takım", dimensions=("team_season_id",))
-    tprof = Source("team_profiles.csv", "Takım profili", dimensions=("team_season_id",))
-    factors = Source("four_factors.csv", "Four Factors", dimensions=("team_season_id",))
-    starts = Source("possession_starts.csv", "Hücum başlangıçları", dimensions=("team_season_id",))
-    pprof = Source("player_profiles.csv", "Oyuncu profili", dimensions=("team_season_id", "player_id"))
-    pct = Source("player_percentiles.csv", "Oyuncu yüzdelikleri", dimensions=("team_season_id", "player_id"))
-    sources = [shots, players, teams, pairs, assists, timeline, flow, clutch, tprof, factors, starts, pprof, pct]
-    for s in sources:
-        _read_columns(s, directory)
-    first_match = pl.read_csv(directory / "score_timeline.csv", try_parse_dates=True).sort("date", "match_id").row(0, named=True)
-    match_label = f"{first_match['date']}  {first_match['home']} - {first_match['away']}"
-    team = pl.read_csv(directory / "pairs.csv").group_by("team").agg(pl.col("poss").max()).sort("poss", descending=True)["team"][0]
-    pp = pl.read_csv(directory / "player_profiles.csv")  # default player: highest usage, qualified if any are
-    star = (pp.filter(pl.col("qualified")) if pp["qualified"].any() else pp).sort("usg", descending=True, nulls_last=True)["player"][0]
+    from .dashboards import design
 
-    court = [(F("plot_x", "none", "qk"), "cols", 0.0, 15.0), (F("plot_y", "none", "qk"), "rows", 0.0, 14.0)]
-    sheets = [
-        Sheet("Şut haritası", shots, cols=[F("plot_x", "none", "qk")], rows=[F("plot_y", "none", "qk")],
-              mark="Circle", color=F("Calculation_result"), aggregate=False, axes=court,
-              tooltip=[F("player", "attr"), F("zone", "attr"), F("xfg", "attr", "qk"), F("period", "attr")],
-              filters=[(F("team"), "all", None), (F("player"), "all", None), (F("zone"), "all", None),
-                       (F("clutch"), "all", None), (F("transition"), "all", None)],
-              title="Şut haritası (arka plan: court.png, X 0-15, Y 0-14)"),
-        Sheet("Altıgen POE", shots, cols=[F("Calculation_hexx", "none", "qk")], rows=[F("Calculation_hexy", "none", "qk")],
-              mark="Circle", color=F("Calculation_poe", "usr", "qk"), size=F("Calculation_n", "usr", "qk"),
-              axes=[(F("Calculation_hexx", "none", "qk"), "cols", 0.0, 15.0), (F("Calculation_hexy", "none", "qk"), "rows", 0.0, 14.0)],
-              filters=[(F("team"), "all", None), (F("player"), "all", None)],
-              title="Beklenenin üstünde/altında: şut başına sayı − xPTS"),
-        Sheet("Oyuncu kalite × başarı", players, cols=[F("xpts_per_shot", "sum", "qk")],
-              rows=[F("poe_per_shot", "sum", "qk")], mark="Circle", color=F("team"), size=F("shots", "sum", "qk"),
-              detail=[F("player")], tooltip=[F("poe_se", "sum", "qk"), F("pts", "sum", "qk"), F("xpts", "sum", "qk")],
-              filters=[(F("shots", "sum", "qk"), "min", 60)],
-              title="Şut kalitesi (x) ve beklenenin üstünde atma (y), en az 60 şut"),
-        Sheet("Takım şut kalitesi", teams, rows=[F("team"), F("side")], cols=[F("xpts_per_shot", "sum", "qk")],
-              mark="Bar", color=F("side"), label=[F("xpts_per_shot", "sum", "qk")],
-              title="Takımın aldığı (offense) ve rakibe verdiği (defense) şut kalitesi"),
-        Sheet("İkili net", pairs, rows=[F("player_a")], cols=[F("player_b")], mark="Square",
-              color=F("net", "sum", "qk"), label=[F("poss", "sum", "qk")],
-              tooltip=[F("minutes", "sum", "qk"), F("a_without_b_net", "sum", "qk"), F("b_without_a_net", "sum", "qk")],
-              filters=[(F("team"), "member", team), (F("poss", "sum", "qk"), "min", 100)],
-              title="İkili birlikteyken net reyting (etiket: hücum sayısı, en az 100)"),
-        Sheet("Asist ağı", assists, rows=[F("passer")], cols=[F("scorer")], mark="Square",
-              size=F("assists", "sum", "qk"), color=F("pts", "sum", "qk"), label=[F("assists", "sum", "qk")],
-              filters=[(F("team"), "member", team)], title="Kim kime asist yapıyor"),
-        Sheet("Maç akışı", timeline, cols=[F("minute", "none", "qk")], rows=[F("margin_home", "none", "qk")],
-              mark="Line", aggregate=False,
-              tooltip=[F("player", "attr"), F("home_score", "attr", "qk"), F("away_score", "attr", "qk")],
-              filters=[(F("Calculation_match"), "member", match_label)],
-              title="Skor farkı (ev sahibi − deplasman)"),
-        Sheet("Geri dönüşler", flow, rows=[F("Calculation_game")], cols=[F("largest_deficit", "sum", "qk")], mark="Bar",
-              label=[F("largest_deficit", "sum", "qk")], filters=[(F("won"), "member", "true"),
-                                                                  (F("largest_deficit", "sum", "qk"), "min", 8)],
-              title="Kazanan takımın kapattığı en büyük fark (8+)"),
-        Sheet("Clutch", clutch, rows=[F("team")], cols=[F("net", "sum", "qk")], mark="Bar",
-              label=[F("poss", "sum", "qk")], title="Son 5 dk, fark ≤ 5: net reyting (etiket: hücum)"),
-        Sheet("Takım reytingleri", tprof, cols=[F("ortg", "sum", "qk")], rows=[F("drtg", "sum", "qk")], mark="Circle",
-              label=[F("team_code")], detail=[F("team")], size=F("games", "sum", "qk"),
-              tooltip=[F("net", "sum", "qk"), F("pace", "sum", "qk"), F("wins", "sum", "qk")],
-              filters=[(F("is_league"), "member", "false")],
-              title="Hücum (x) ve savunma (y) reytingi, 100 hücumda sayı: sağ alt en iyisi"),
-        Sheet("Four Factors", factors, rows=[F("team")], cols=[F("side"), F("factor")], mark="Square",
-              color=F("better", "sum", "qk"), label=[F("value", "sum", "qk")], tooltip=[F("league", "sum", "qk")],
-              title="Four Factors: yeşil lig ortalamasından iyi, kırmızı kötü"),
-        Sheet("Hücum başlangıçları", starts, rows=[F("start"), F("side")], cols=[F("ppp", "sum", "qk")], mark="Bar",
-              color=F("side"), label=[F("ppp", "sum", "qk")],
-              tooltip=[F("poss", "sum", "qk"), F("share", "sum", "qk"), F("league_ppp", "sum", "qk")],
-              filters=[(F("team"), "member", team)],
-              title="Hücum nasıl başlarsa kaç sayı getiriyor (hücum başına sayı)"),
-        Sheet("Oyuncu profili", pct, rows=[F("label")], cols=[F("pct", "sum", "qk")], mark="Bar",
-              color=F("pct", "sum", "qk"), label=[F("value", "sum", "qk")], filters=[(F("player"), "member", star)],
-              axes=[(F("pct", "sum", "qk"), "cols", 0.0, 100.0)],
-              title="Ligdeki yeri: yüzdelik (en az 100 dakika oynayanlar arasında)"),
-        Sheet("Kullanım × verimlilik", pprof, cols=[F("usg", "sum", "qk")], rows=[F("ts", "sum", "qk")], mark="Circle",
-              color=F("team"), size=F("minutes", "sum", "qk"), detail=[F("player")],
-              tooltip=[F("ppg", "sum", "qk"), F("mpg", "sum", "qk")], filters=[(F("qualified"), "member", "true")],
-              title="Kullanım oranı (x) ve gerçek şut yüzdesi TS% (y)"),
-        Sheet("On/Off", pprof, rows=[F("player")], cols=[F("on_off", "sum", "qk")], mark="Bar",
-              label=[F("on_off", "sum", "qk")], tooltip=[F("on_net", "sum", "qk"), F("off_net", "sum", "qk"),
-                                                         F("minutes", "sum", "qk")],
-              filters=[(F("team"), "member", team), (F("qualified"), "member", "true")],
-              title="Oyuncu sahadayken ve kenardayken takımın net reyting farkı"),
-    ]
-    by = {s.name: s for s in sheets}
-    dashboards = [
-        _dashboard("Şut Kalitesi", "TBL 2026-27 · Şut kalitesi (xPTS)",
-                   [("Şut haritası", 1000, 8000, 45000, 84000), ("Oyuncu kalite × başarı", 47000, 8000, 52000, 46000),
-                    ("Takım şut kalitesi", 47000, 55000, 52000, 44000)],
-                   [(by["Şut haritası"], F("team"), 1000, 92500, 22000, 6500, False),
-                    (by["Şut haritası"], F("player"), 23500, 92500, 22000, 6500, False)]),
-        _dashboard("İkililer", "TBL 2026-27 · İkililer ve asist ağı",
-                   [("İkili net", 1000, 8000, 55000, 91000), ("Asist ağı", 57000, 8000, 42000, 91000)], []),
-        _dashboard("Maç Akışı", "TBL 2026-27 · Maç akışı, geri dönüşler, clutch",
-                   [("Maç akışı", 1000, 8000, 98000, 44000), ("Geri dönüşler", 1000, 53000, 55000, 46000),
-                    ("Clutch", 57000, 53000, 42000, 46000)], []),
-        _dashboard("Takım Profili", "TBL 2026-27 · Takım profilleri",
-                   [("Takım reytingleri", 1000, 8000, 40000, 44000), ("Hücum başlangıçları", 1000, 53000, 40000, 39000),
-                    ("Four Factors", 42000, 8000, 57000, 91000)],
-                   [(by["Hücum başlangıçları"], F("team"), 1000, 92500, 25000, 6500, True)]),
-        _dashboard("Oyuncu Profili", "TBL 2026-27 · Oyuncu profilleri",
-                   [("Oyuncu profili", 1000, 15000, 45000, 84000), ("Kullanım × verimlilik", 47000, 8000, 52000, 45000),
-                    ("On/Off", 47000, 54000, 52000, 45000)],
-                   [(by["Oyuncu profili"], F("player"), 1000, 8000, 30000, 6500, True)]),
-    ]
-
-    wb = ET.Element("workbook", {"original-version": VERSION, "source-build": BUILD, "source-platform": "mac",
-                                 "version": VERSION})
-    manifest = ET.SubElement(wb, "document-format-change-manifest")
-    for tag in ("AnimationOnByDefault", "IntuitiveSorting", "IntuitiveSorting_SP2", "MarkAnimation",
-                "ObjectModelEncapsulateLegacy", "ObjectModelExtractV2", "ObjectModelTableType", "SchemaViewerObjectModel",
-                "SheetIdentifierTracking", "WindowsPersistSimpleIdentifiers"):
-        ET.SubElement(manifest, tag)
-    prefs = ET.SubElement(wb, "preferences")
-    ET.SubElement(prefs, "preference", name="ui.encoding.shelf.height", value="24")
-    ET.SubElement(prefs, "preference", name="ui.shelf.height", value="26")
-    dss = ET.SubElement(wb, "datasources")
-    for s in sources:
-        dss.append(_datasource(s, directory, _write_extract(s, directory)))
-    wss = ET.SubElement(wb, "worksheets")
-    for sh in sheets:
-        wss.append(_worksheet(sh))
-    dbs = ET.SubElement(wb, "dashboards")
-    wins = ET.SubElement(wb, "windows", {"source-height": "30"})
-    for d, w in dashboards:
-        dbs.append(d)
-    for sh in sheets:
-        wins.append(_window_ws(sh))
-    for _, w in dashboards:
-        wins.append(w)
-    tree = ET.ElementTree(wb)
-    ET.indent(tree, "  ")
-    with open(path, "wb") as fh:
-        fh.write(b"<?xml version='1.0' encoding='utf-8' ?>\n\n")
-        tree.write(fh, encoding="utf-8", xml_declaration=False)
+    design(directory).write(path)

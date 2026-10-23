@@ -8,31 +8,29 @@ CSV dosyaları ve `court.png` (FIBA yarı saha, 15 m × 14 m, dip çizgi altta).
 > seçeneğini kapatın; yine de veriyi gizli sayamayız.
 
 ## Hazır workbook
-`tbl-2026-27.twb` aynı klasörde. İçinde 15 sayfa ve 5 dashboard hazır geliyor:
+`tbl-2026-27.twb` aynı klasörde. Kodla üretiliyor (`src/tbl_data/analysis/dashboards.py` tasarım,
+`workbook.py` XML) ve her `tbl analyze` çalıştırmasında yenileniyor. İçinde 6 dashboard var:
 
-- **Şut Kalitesi:** şut haritası, oyuncu dağılımı, takım şut kalitesi.
-- **İkililer:** ikili net reyting ve asist ağı.
-- **Maç Akışı:** skor farkı, geri dönüşler, clutch.
-- **Takım Profili:** hücum × savunma reytingi, Four Factors ısı haritası, hücumun nasıl
-  başladığına göre verim.
-- **Oyuncu Profili:** seçilen oyuncunun ligdeki yüzdelik dilimleri, kullanım × TS%,
-  takım bazında on/off.
+| Dashboard | Ne gösteriyor | Tıklayınca |
+|---|---|---|
+| Takımlar | künye, hücum × savunma reytingi, dört faktör, hücum başlangıçlarına göre verim | takım seçilir |
+| Şut Kalitesi | altıgen şut haritası (saha görseli hazır), oyuncu ve takım şut kalitesi | oyuncu ya da takım seçilir |
+| Oyuncular | oyuncu kartı, ligdeki yüzdelik profili, kullanım × TS%, on/off | oyuncu seçilir |
+| İkililer | ikililer birlikte / biri kenardayken, asist ağı | pası veren oyuncu seçilir |
+| Maçlar | skor farkı (basamaklı çizgi), maç özeti, seriler, geri dönüşler, clutch | maç ya da takım seçilir |
+| Yöntem | veri, sözlük, küçük örneklem uyarısı | — |
 
-Ayrıca bir "Altıgen POE" sayfası var.
+**Etkileşim:** Takım, Oyuncu ve Maç birer parametredir; üstteki listelerden ya da grafiklere
+tıklayarak seçilir ve bütün dashboard'lara geçer (seçili olan turuncu, diğerleri gri). Seçili
+işarete tekrar tıklamak seçimi kaldırır; listeden "Tümü" seçmek de sıfırlar. Hiçbir şey seçili
+değilken oyuncu/ikili sayfaları örnek olarak en iyi net reytingli takımı ve onun en çok süre alan
+oyuncusunu gösterir. Üstteki butonlar dashboard'lar arasında gezdirir.
 
-1. Tableau Public'i kurup `tbl-2026-27.twb` dosyasını açın.
-2. Tek elle yapılacak adım, saha görseli: **Map → Background Images → Şutlar → Add
-   Image** ile `court.png` dosyasını seçin. X Field `plot_x` (0–15), Y Field
-   `plot_y` (0–14). Aynısını "Altıgen POE" için Hex X ve Hex Y alanlarıyla yapın.
-3. **File → Save to Tableau Public As…** ile kaydedin.
+**Yayınlama:** dosyayı Tableau Public'te açın ve **File → Save to Tableau Public As…** ile kaydedin
+(veri kaynakları Hyper extract olduğu için ek adım gerekmez). Yayından sonra workbook sayfasında
+indirme iznini kapatın ve "Show sheets as tabs" ayarını kapalı bırakın (gezinme butonları var).
 
-Tableau Public yalnızca extract kullanan workbook'ları kaydediyor; bu yüzden her CSV'nin yanında
-bir `.hyper` extract dosyası da üretiliyor ve workbook bunlara bağlı.
-
-Workbook kodla üretiliyor (`src/tbl_data/analysis/workbook.py`) ve her `tbl analyze`
-çalıştırmasında yenileniyor. Tableau'da yaptığınız değişiklikleri kalıcı yapmak
-istiyorsanız dosyayı farklı bir adla kaydedin. Aşağıdaki adımlar aynı görünümleri
-elle kurmak ya da değiştirmek için.
+Aşağıdaki adımlar aynı görünümleri elle kurmak ya da değiştirmek için.
 
 ## 0. Kurulum
 1. [public.tableau.com](https://public.tableau.com) üzerinden ücretsiz hesap açın ve

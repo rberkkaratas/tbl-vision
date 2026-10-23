@@ -75,7 +75,8 @@ def test_tableau_export_writes_a_consistent_workbook(staged, tmp_path):
     a = analyze(staged.tables, e)
     export(staged.tables, e, a.tables, tmp_path / "tbl-test")
     root = ET.parse(tmp_path / "tbl-test" / "tbl-test.twb").getroot()
-    assert len(root.find("worksheets")) == 15 and len(root.find("dashboards")) == 5
+    assert len(root.find("worksheets")) == 18 and len(root.find("dashboards")) == 6
+    assert root.find("actions") is not None and len(root.find("actions")) >= 10  # click a mark -> set a parameter
     for ws in root.find("worksheets"):  # every field on a shelf is declared in the sheet
         declared = {ci.get("name") for ci in ws.iter("column-instance")}
         used = set(re.findall(r"\]\.(\[[a-z]+:[^\]]+:[nqo]k\])", ET.tostring(ws, encoding="unicode")))
