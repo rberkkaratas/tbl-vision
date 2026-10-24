@@ -36,6 +36,9 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
     opp = staged["teams"].select(opponent_id="team_season_id", opponent="name")
     names = player_names(staged)
     m = staged["matches"].select("match_id", "week", "phase", date=pl.col("start_utc").dt.date())
+    # forfeits: game_flow keeps the played score, official_pts is the 20-0 result
+    forfeit = pl.concat([staged["matches"].select("match_id", "forfeit", team_season_id=f"{side}_team_id",
+                                                  official_pts=f"{side}_score") for side in ("home", "away")])
     mt = staged["match_teams"].select("match_id", "team_season_id", "is_home")
     opp_of = mt.join(mt.select("match_id", opponent_id="team_season_id"), on="match_id").filter(
         pl.col("team_season_id") != pl.col("opponent_id")).drop("is_home")
@@ -73,7 +76,8 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
             mt.filter(~pl.col("is_home")).select("match_id", away_id="team_season_id"), on="match_id").join(
             teams.rename({"team_season_id": "away_id", "team": "away", "team_code": "away_code"}), on="away_id").join(
             names, on="player_id", how="left").with_columns(minute=(pl.col("elapsed_s") / 60).round(2)),
-        "game_flow": tables["game_flow"].join(m, on="match_id").join(teams, on="team_season_id").join(opp, on="opponent_id"),
+        "game_flow": tables["game_flow"].join(m, on="match_id").join(forfeit, on=["match_id", "team_season_id"])
+                     .join(teams, on="team_season_id").join(opp, on="opponent_id"),
         "runs": tables["runs"].join(m, on="match_id").join(teams, on="team_season_id"),
         "clutch_team": tables["clutch_team"].join(teams, on="team_season_id"),
         "team_profiles": tables["team_profiles"].join(teams, on="team_season_id", how="left").with_columns(

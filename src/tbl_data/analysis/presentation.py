@@ -30,7 +30,8 @@ def _fmt(col: str, f) -> pl.Expr:
 
 
 def short_name(name: str) -> str:
-    parts = name.split()
+    """"Tayfun Erülkü (Yalovaspor)" -> "T. Erülkü": short names appear inside one team's views."""
+    parts = name.split(" (")[0].split()
     return name if len(parts) < 2 else f"{parts[0][0]}. {parts[-1]}"
 
 
@@ -62,6 +63,16 @@ def augment(files: dict[str, pl.DataFrame], codes: dict[str, str]) -> dict[str, 
                                      .otherwise(code("team")))
     f["game_flow"] = f["game_flow"].with_columns(opponent_short=code("opponent"))
     f["shots"] = f["shots"].with_columns(opponent_short=code("opponent"))
+
+    # a player who changed clubs mid-season has a row per club; the Oyuncu parameter filters by
+    # name, so those names carry the club: "Tayfun Erülkü (Yalovaspor)"
+    per_club = f["player_profiles"].group_by("player").agg(pl.col("team").n_unique())
+    moved = per_club.filter(pl.col("team") > 1)["player"]
+    for k, cols in {"player_profiles": ["player"], "player_percentiles": ["player"], "player_shooting": ["player"],
+                    "player_zone_shooting": ["player"], "clutch_player": ["player"], "shots": ["player", "assist_player"],
+                    "pairs": ["player_a", "player_b"], "assist_pairs": ["passer", "scorer"]}.items():
+        f[k] = f[k].with_columns(pl.when(pl.col(c).is_in(moved)).then(pl.format("{} ({})", pl.col(c), code("team")))
+                                 .otherwise(pl.col(c)).alias(c) for c in cols)
 
     # team KPI strip (team rows + the league row)
     tp = f["team_profiles"]
@@ -164,7 +175,10 @@ def augment(files: dict[str, pl.DataFrame], codes: dict[str, str]) -> dict[str, 
         result=pl.when(pl.col("won")).then(pl.lit("Kazandı")).otherwise(pl.lit("Kaybetti")),
         lead_min=(pl.col("time_leading_s") / 60).round(1),
         comeback=pl.format("{} {}–{} {} · {}. hf", pl.col("team_short"), pl.col("pts"), pl.col("opp_pts"),
-                           pl.col("opponent_short"), pl.col("week")))
+                           pl.col("opponent_short"), pl.col("week")),
+        # 1 = the biggest deficit a winner overcame (a whole season has too many comebacks to list)
+        comeback_rank=pl.when(pl.col("won")).then(
+            pl.col("largest_deficit").rank("ordinal", descending=True).over("won")))
     summary = [("Sayı", "pts", 0), ("En büyük fark", "biggest_lead", 0), ("En uzun seri", "biggest_run", 0),
                ("Önde (dk)", "lead_min", 1), ("Eşitlik", "times_tied", 0), ("Liderlik değişimi", "lead_changes_game", 0),
                ("En çok geride", "largest_deficit", 0)]

@@ -69,13 +69,18 @@ Genius requests send `If-None-Match`; a 304 stores nothing new.
 | `tbf_box`, `tbf_events`, `tbf_shots` | TBF copies, kept only for cross-checks | TBF |
 
 Keys: `match_id` = TBF matchId, `player_id` = TBF person id, `team_season_id` = TBF teamProcessId.
-Genius players are mapped to TBF ids by (team, jersey). Column names are English;
-TBF field quirks (`twoPointShots` = 2P made, `rivalFoul` = fouls drawn, ...) are decoded in `parse/tbf.py`.
+Genius players are mapped to TBF ids by (team, jersey); where TBF's box lacks the jersey,
+by name within the team (ASCII-folded surname, then first name), and a player TBF omits
+from one game's box gets his season id if his name is unique in the season. Column names
+are English; TBF field quirks (`twoPointShots` = 2P made, `rivalFoul` = fouls drawn, ...)
+are decoded in `parse/tbf.py`. `matches.forfeit` marks games played but scored 20-0 at the
+table (2025-26: Yalovaspor, 7 games); scores there are official, analysis uses the played score.
 
-`tbl build` fails if a blocking check fails: TBF and Genius box scores equal, 1:1 player
-mapping, points add up, per-period points sum to the final, shots = FGA, TBF game-flow
-is a subset of Genius pbp, no unseen source fields. Informational notes (2026-27): one
-TBF minutes misattribution (345930), one incomplete TBF shot chart (345937), and old or
+`tbl build` fails if a blocking check fails: 1:1 mapping of every player who played,
+mapped Genius and TBF names share a word, points add up, per-period points sum to the
+final, shots = FGA, TBF game-flow is a subset of Genius pbp, no unseen source fields.
+Informational notes: TBF box score vs Genius (2025-26 week 1 TBF box is stale; Genius is
+kept), TBF minutes misattributions, incomplete TBF shot charts, forfeits, and old or
 national-team career rows without shot splits.
 
 ### Column conventions (verified against the FIBA Statisticians' Manual 2024)
@@ -90,7 +95,7 @@ national-team career rows without shot splits.
 - In `events`, rebounds with `sub_type = 'offensivedeadball'` are not rebounds (ball not
   live after a missed non-final FT); team rebounds/turnovers have `player_id` null.
 - `pts_paint` = made 2pt shots in the restricted area (no FTs); `times_tied` is the raw
-  Genius counter (can be 1–2 above a recount).
+  Genius counter (it does not always count a score level at a period break).
 - Sort play-by-play by `(period_ord, elapsed_s, action_number)`: ~0.3% of actions are
   entered late, so action_number alone can run the clock backwards.
 - Shots: `x`, `y` are 0–100 of the full 28 × 15 m court; teams switch ends at halftime

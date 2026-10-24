@@ -20,6 +20,7 @@ INK, SEC, RULE = "#1b2430", "#5b6673", "#e3e6ea"
 ACCENT, ACCENT_LIGHT, GREY, LOW = "#e8590c", "#f6b48a", "#b4bcc5", "#e1e5ea"
 GOOD, GOOD_L, MID, BAD_L, BAD = "#2166ac", "#92c5de", "#dcdcdc", "#f4a582", "#b2182b"
 ALL = "Tümü"
+TOP_COMEBACKS = 8  # rows that fit the comeback chart at a readable size
 NAV = ["Takımlar", "Şut Kalitesi", "Oyuncular", "İkililer", "Maçlar", "Yöntem"]
 
 T_TITLE = {"fontname": "Tableau Semibold", "fontsize": "20", "fontcolor": INK}
@@ -89,7 +90,8 @@ def player_block(top_player_case: str) -> list[Calc]:
              f'IF [player] = {{Oyuncu}} THEN "Seçili oyuncu" ELSEIF {{Takım}} <> "{ALL}" AND [team] = {{Takım}} '
              f'THEN "Seçili takım" ELSEIF {{Oyuncu}} = "{ALL}" AND {{Takım}} = "{ALL}" THEN "{ALL}" ELSE "Diğer" END',
              "string"),
-        Calc("kisa_ad", "Kısa Ad", 'LEFT([player], 1) + ". " + SPLIT([player], " ", -1)', "string"),
+        # drops the club a mid-season transfer carries: "Tayfun Erülkü (Yalovaspor)" -> "T. Erülkü"
+        Calc("kisa_ad", "Kısa Ad", 'LEFT([player], 1) + ". " + SPLIT(SPLIT([player], " (", 1), " ", -1)', "string"),
         Calc("oyuncu_etiket", "Oyuncu Etiketi",
              f'IF [player] = {{Oyuncu}} OR ({{Takım}} <> "{ALL}" AND [team] = {{Takım}}) '
              'THEN [Calculation_kisa_ad] END', "string"),
@@ -140,6 +142,8 @@ def design(directory: Path) -> Workbook:
     per_team = gf.group_by("team_season_id").len()["len"]
     g_lo, g_hi = int(per_team.min()), int(per_team.max())
     games_txt = f"{g_lo}–{g_hi}" if g_lo != g_hi else str(g_lo)
+    lost = gf.filter(pl.col("forfeit") & (pl.col("official_pts") == 0)).group_by("team").len().sort("team")
+    forfeits = [f"{nick[t]} ({n})" for t, n in lost.iter_rows()]  # team (games it lost 0-20 at the table)
     rating_se = round(110 / (tp.filter(~pl.col("is_league"))["poss"].mean() ** 0.5))  # 1 SE of a team rating
     qmin = int(pp["qualify_min"][0])
     footer = (f"Veri: TBF ve FIBA LiveStats kamuya açık maç verisi · {n_games} maç, {weeks[0]}–{weeks[1]}. hafta · "
@@ -163,7 +167,8 @@ def design(directory: Path) -> Workbook:
     p_team = Param("Takım", "string", ALL, members=[(ALL, None)] + [(t, nick[t]) for t in teams])
     players = pp.sort("player")
     p_player = Param("Oyuncu", "string", ALL, members=[(ALL, None)] + [
-        (r["player"], f"{r['player']} ({r['team_short']})") for r in players.iter_rows(named=True)])
+        (r["player"], r["player"] if r["player"].endswith(")") else f"{r['player']} ({r['team_short']})")
+        for r in players.iter_rows(named=True)])  # a mid-season transfer's name already carries the club
     p_side = Param("Taraf", "string", "Hücum", members=[("Hücum", None), ("Savunma", None)])
     p_ctx = Param("Şut Bağlamı", "string", ALL, members=[(v, None) for v in
                                                         (ALL, "Hızlı hücum", "Set hücum", "İkinci şans",
@@ -344,7 +349,9 @@ def design(directory: Path) -> Workbook:
         Calc("gosterilen_takim", "Gösterilen Takım", shown_team, "string"),
         Calc("gosterilen_kisa", "Gösterilen Takım (kısa)", short_case, "string"),
         Calc("onoff_filtre", "OnOff Filtresi",
-             "[team] = [Calculation_gosterilen_takim] AND [minutes] >= 50 AND NOT ISNULL([on_off])", "boolean"),
+             # a fifth of the qualifying minutes (50 for a short season): fewer is noise and crowds the list
+             f"[team] = [Calculation_gosterilen_takim] AND [minutes] >= {max(50, qmin // 5)} AND NOT ISNULL([on_off])",
+             "boolean"),
         Calc("onoff_renk", "OnOff Renk", f'IF [minutes] < {qmin} THEN "Az veri" ELSEIF [on_off] >= 0 '
                                          'THEN "Sahadayken daha iyi" ELSE "Sahadayken daha kötü" END', "string"),
         Calc("onoff_satir", "Oyuncu", 'IF [player] = {Oyuncu} THEN "▶ " + [Calculation_kisa_ad] '
@@ -456,7 +463,8 @@ def design(directory: Path) -> Workbook:
                      calcs=[Calc("mac_filtre", "Maç Filtresi", "[match_id] = {Maç}", "boolean")])
     flow = Source("game_flow.csv", "Maç akışı", dimensions=("match_id", "team_season_id", "opponent_id", "week"), calcs=[
         *team_block(),
-        Calc("geri_donus", "Geri Dönüş Filtresi", "[won] AND [largest_deficit] >= 8", "boolean"),
+        Calc("geri_donus", "Geri Dönüş Filtresi",
+             f"[won] AND [largest_deficit] >= 8 AND ([comeback_rank] <= {TOP_COMEBACKS} OR [team] = {{Takım}})", "boolean"),
         Calc("mac_vurgu", "Maç Vurgu",
              f'IF [match_id] = {{Maç}} THEN "Seçili maç" ELSEIF {{Takım}} <> "{ALL}" AND ([team] = {{Takım}} '
              'OR [opponent] = {Takım}) THEN "Seçili takımın maçı" ELSE "Diğer" END', "string"),
@@ -474,17 +482,15 @@ def design(directory: Path) -> Workbook:
                                                        "Diğer": GREY}})
     m1 = Sheet("M1 Skor farkı", timeline, cols=[F("minute", "none", "qk")], rows=[F("margin_home", "none", "qk")],
                mark="Line", aggregate=False, line_step=True, tooltip=[F("clock_label"), F("score_label"), F("player")],
-               detail=[F("home_short", "attr", "nk"), F("away_short", "attr", "nk"), F("home_score", "max", "qk"),
-                       F("away_score", "max", "qk"), F("date", "attr", "ok")],
+               detail=[F("match", "attr", "nk"), F("date", "attr", "ok")],
                filters=[("true", F("Calculation_mac_filtre"))],
                axes=[Axis(F("minute", "none", "qk"), "cols", title="Dakika", fmt=FMT_0),
                      Axis(F("margin_home", "none", "qk"), "rows", title="Fark (ev sahibi − deplasman)", fmt=FMT_0)],
                reflines=[RefLine(F("margin_home", "none", "qk"), 0.0), RefLine(F("minute", "none", "qk"), 10.0, "Ç2"),
                          RefLine(F("minute", "none", "qk"), 20.0, "Ç3"), RefLine(F("minute", "none", "qk"), 30.0, "Ç4")],
                title=title("", "↑ ev sahibi önde · ↓ deplasman önde",
-                           [("<[attr:home_short:nk]>", T_SHEET), (" ", T_SHEET), ("<[max:home_score:qk]>", T_SHEET),
-                            ("–", T_SHEET), ("<[max:away_score:qk]>", T_SHEET), (" ", T_SHEET),
-                            ("<[attr:away_short:nk]>", T_SHEET), (" · ", T_SHEET2), ("<[attr:date:ok]>", T_SHEET2)]),
+                           # one field: the line's marks are disaggregated, so MAX(score) would read "0 to 91"
+                           [("<[attr:match:nk]>", T_SHEET), (" · ", T_SHEET2), ("<[attr:date:ok]>", T_SHEET2)]),
                tooltip_runs=tip("<[none:clock_label:nk]>", NL, "<[none:player:nk]>", NL, "Skor ",
                                 "<[none:score_label:nk]>"))
     m2 = Sheet("M2 Maç özeti", summary, rows=[F("team"), F("result")], cols=[F("metric")], mark="Text",
@@ -501,7 +507,7 @@ def design(directory: Path) -> Workbook:
                sorts=[(F("comeback"), F("largest_deficit", "sum", "qk"), "DESC", "rows")],
                axes=[Axis(F("largest_deficit", "sum", "qk"), "cols", title="Kazanırken en çok kaç sayı geride kaldı",
                           fmt=FMT_0)],
-               title=title("En büyük geri dönüşler", "Tıklayın: maç akışı sağda açılır"),
+               title=title("En büyük geri dönüşler", f"İlk {TOP_COMEBACKS} ve seçili takımınkiler · tıklayın: maç akışı sağda açılır"),
                tooltip_runs=tip("<[none:comeback:nk]>", NL, "En çok ", "<[sum:largest_deficit:qk]>", " sayı gerideydi"))
     m5 = Sheet("M5 Clutch", clutch, rows=[F("Calculation_takim_etiket")], cols=[F("net", "sum", "qk")], mark="Bar",
                color=F("Calculation_clutch_renk"), label=[F("label")], detail=[F("team"), F("Calculation_takim_tik")],
@@ -572,7 +578,7 @@ def design(directory: Path) -> Workbook:
             Zone("sheet", 392, 590, 792, 184, sheet=m3.name)]),
         Dashboard("Yöntem", frame("Veri, yöntem ve sözlük", "Bu çalışma nasıl yapıldı, sayılar nasıl okunmalı", None,
                                   footer) + [
-            Zone("text", 16, 80, 370, 690, runs=method_veri(n_games, weeks, season, n_teams, span)),
+            Zone("text", 16, 80, 370, 690, runs=method_veri(n_games, weeks, season, n_teams, span, forfeits)),
             Zone("text", 410, 80, 370, 690, runs=method_sozluk()),
             Zone("text", 804, 80, 380, 690, runs=method_orneklem(games_txt, rating_se))]),
     ]
@@ -596,7 +602,9 @@ def design(directory: Path) -> Workbook:
     return Workbook(d, params, sources, sheets, dashboards, actions, start="Takımlar")
 
 
-def method_veri(n_games: int, weeks, season: str, n_teams: int, span: str) -> list[tuple[str, dict]]:
+def method_veri(n_games: int, weeks, season: str, n_teams: int, span: str, forfeits: list[str]) -> list[tuple[str, dict]]:
+    forfeit_txt = (f" Oynanıp sonradan hükmen 0–20 tescil edilen maçlar: {', '.join(forfeits)}; bu maçlarda "
+                   "sahada oynanan skor kullanıldı." if forfeits else "")
     return [("Veri", T_H), NL, NL, (
         f"TBL (Türkiye Basketbol Ligi) {season} {span}, {weeks[0]}–{weeks[1]}. hafta, {n_games} maç, {n_teams} takım. "
         "Kaynak: Türkiye Basketbol Federasyonu ve FIBA LiveStats'in kamuya açık maç verisi (oyun oyun kayıt, şut "
@@ -604,8 +612,9 @@ def method_veri(n_games: int, weeks, season: str, n_teams: int, span: str) -> li
         "Hücumlar her olaydan tek tek sayıldı (Dean Oliver tanımı: hücum ribaundu hücumu uzatır). Reytingler 100 "
         "hücum başına sayıdır. Oyuncu oranları oyuncu sahadayken takımın yaptıklarına göre hesaplandı.", T_BODY), NL, NL, (
         "Veri resmi box score ile ve FIBA LiveStats'in kendi maç özetleriyle (en büyük fark, seri, liderlik değişimi, "
-        "eşitlik, önde geçen süre) birebir doğrulandı. Konumu tahmin edilen tip-in'ler ve yarı sahanın ötesinden "
-        "atılan şutlar haritada gösterilmez.", T_BODY)]
+        "önde geçen süre) birebir doğrulandı; eşitlik sayısında LiveStats çeyrek arasındaki beraberliği her zaman "
+        "saymıyor. Konumu tahmin edilen tip-in'ler ve yarı sahanın ötesinden atılan şutlar haritada gösterilmez."
+        + forfeit_txt, T_BODY)]
 
 
 def method_sozluk() -> list[tuple[str, dict]]:
