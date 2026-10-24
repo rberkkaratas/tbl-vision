@@ -10,17 +10,14 @@ Player rates use what happened while the player was on court (from the lineups):
   ORB% / DRB% = player rebounds / available rebounds on court (team + opponent)
   STL% = steals / opponent possessions on court; BLK% = blocks / opponent 2PA on court
   on/off = team net rating with the player on court minus with the player off
-Percentiles are among players with at least QUALIFY_MIN minutes.
+Percentiles are among qualified players: QUALIFY_MPG minutes per team game (at least 100 minutes).
 """
 
 from __future__ import annotations
 
-from datetime import date
-
 import polars as pl
 
-QUALIFY_MIN = 100
-SEASON_START = date(2026, 10, 1)
+QUALIFY_MPG, QUALIFY_FLOOR = 15, 100  # 7 games -> 105 min, a 30-game season -> 450 min
 ZONES = ["rim", "paint", "midrange", "corner_3", "above_break_3"]
 BOX = ["pts", "fgm", "fga", "fg2m", "fg2a", "fg3m", "fg3a", "ftm", "fta", "oreb", "dreb", "reb", "ast", "tov", "stl",
        "blk", "pf", "fouls_drawn"]
@@ -130,8 +127,11 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         on_opp_fg2a=(~own & (a == "2pt")).sum())
 
     names = staged["players"].select("player_id", player="full_name").unique("player_id")  # TBF: one spelling
+    season_start = staged["matches"]["start_utc"].min().date()  # ages at the season's first game
     info = staged["players"].select("player_id", "nationality", "birth_date").unique("player_id").with_columns(
-        age=((pl.lit(SEASON_START) - pl.col("birth_date")).dt.total_days() / 365.25).round(1))
+        age=((pl.lit(season_start) - pl.col("birth_date")).dt.total_days() / 365.25).round(1))
+    team_games = mt.group_by("team_season_id").len()["len"].median()
+    qualify_min = max(QUALIFY_FLOOR, round(QUALIFY_MPG * team_games / 10) * 10)
     teams = staged["teams"].select("team_season_id", team="name")
     shoot = shooting.select("team_season_id", "player_id", xpts_per_shot="xpts_per_shot", poe_per_shot="poe_per_shot",
                             poe_se="poe_se")
@@ -160,7 +160,7 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         off_ortg=_div(pl.col("t_pts_for") - pl.col("on_pts_for"), pl.col("t_poss_for") - pl.col("on_poss_for"), 100, 1),
         off_drtg=_div(pl.col("t_pts_against") - pl.col("on_pts_against"),
                       pl.col("t_poss_against") - pl.col("on_poss_against"), 100, 1),
-        qualified=m >= QUALIFY_MIN,
+        qualified=m >= qualify_min, qualify_min=pl.lit(qualify_min),
     ).with_columns(on_net=(pl.col("on_ortg") - pl.col("on_drtg")).round(1),
                    off_net=(pl.col("off_ortg") - pl.col("off_drtg")).round(1)).with_columns(
         on_off=(pl.col("on_net") - pl.col("off_net")).round(1)).drop("t_poss_for", "t_poss_against", "t_pts_for",

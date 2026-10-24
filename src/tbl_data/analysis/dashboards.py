@@ -133,8 +133,17 @@ def design(directory: Path) -> Workbook:
     x_xpts, y_ts = rng(psh["xpts_per_shot"], 0.05, (0.8, 1.4)), rng(q["ts"], 0.05, (0.3, 0.9))
     short_case = "CASE [Calculation_gosterilen_takim] " + " ".join(
         f'WHEN "{t}" THEN "{n}"' for t, n in nick.items()) + " END"
+    season = d.name.split("-", 1)[1] if "-" in d.name else d.name  # tableau/tbl-2025-26 -> 2025-26
+    n_teams = len(nick)
+    playoffs = (gf["phase"] != "regular").any()
+    span = "normal sezon ve play-off" if playoffs else "normal sezon"
+    per_team = gf.group_by("team_season_id").len()["len"]
+    g_lo, g_hi = int(per_team.min()), int(per_team.max())
+    games_txt = f"{g_lo}–{g_hi}" if g_lo != g_hi else str(g_lo)
+    rating_se = round(110 / (tp.filter(~pl.col("is_league"))["poss"].mean() ** 0.5))  # 1 SE of a team rating
+    qmin = int(pp["qualify_min"][0])
     footer = (f"Veri: TBF ve FIBA LiveStats kamuya açık maç verisi · {n_games} maç, {weeks[0]}–{weeks[1]}. hafta · "
-              "TBL 2026-27 normal sezon · tbl-vision")
+              f"TBL {season} {span} · tbl-vision")
 
     # showcase defaults, so that no view is empty when nothing is selected
     showcase_team = tp.filter(~pl.col("is_league")).sort("net", descending=True)["team"][0]
@@ -336,14 +345,14 @@ def design(directory: Path) -> Workbook:
         Calc("gosterilen_kisa", "Gösterilen Takım (kısa)", short_case, "string"),
         Calc("onoff_filtre", "OnOff Filtresi",
              "[team] = [Calculation_gosterilen_takim] AND [minutes] >= 50 AND NOT ISNULL([on_off])", "boolean"),
-        Calc("onoff_renk", "OnOff Renk", 'IF [minutes] < 100 THEN "Az veri (<100 dk)" ELSEIF [on_off] >= 0 '
+        Calc("onoff_renk", "OnOff Renk", f'IF [minutes] < {qmin} THEN "Az veri" ELSEIF [on_off] >= 0 '
                                          'THEN "Sahadayken daha iyi" ELSE "Sahadayken daha kötü" END', "string"),
         Calc("onoff_satir", "Oyuncu", 'IF [player] = {Oyuncu} THEN "▶ " + [Calculation_kisa_ad] '
                                       'ELSE [Calculation_kisa_ad] END', "string"),
     ], captions={"usg": "Kullanım (USG%)", "ts": "TS%", "on_off": "On/off farkı", "minutes": "Dakika",
                  "player": "Oyuncu", "team": "Takım"},
         colors={"[none:Calculation_oyuncu_vurgu:nk]": PLAYER_COLORS,
-                "[none:Calculation_onoff_renk:nk]": {"Az veri (<100 dk)": LOW, "Sahadayken daha iyi": GOOD,
+                "[none:Calculation_onoff_renk:nk]": {"Az veri": LOW, "Sahadayken daha iyi": GOOD,
                                                      "Sahadayken daha kötü": BAD}})
     pct = Source("player_percentiles.csv", "Oyuncu yüzdelikleri",
                  dimensions=("team_season_id", "player_id", "metric_order"), calcs=[
@@ -366,7 +375,7 @@ def design(directory: Path) -> Workbook:
                       (F("label"), F("metric_order", "min", "ok"), "ASC", "rows")],
                axes=[Axis(F("pct", "avg", "qk"), "cols", 0, 100, title="Yüzdelik (50 = lig ortancası)", fmt=FMT_0)],
                reflines=[RefLine(F("pct", "avg", "qk"), 50.0)], formats={"[avg:pct:qk]": FMT_0},
-               title=title("Ligdeki yeri", "100+ dakika oynayanlar arasında yüzdelik · gri çubuklar oyun stilidir"),
+               title=title("Ligdeki yeri", f"{qmin}+ dakika oynayanlar arasında yüzdelik · gri çubuklar oyun stilidir"),
                tooltip_runs=tip("<[none:label:nk]>", ": ", "<[none:value_text:nk]>", NL, "Yüzdelik: ", "<[avg:pct:qk]>"))
     o3 = Sheet("O3 Kullanım × TS", pprof, cols=[F("usg", "avg", "qk")], rows=[F("ts", "avg", "qk")], mark="Circle",
                color=F("Calculation_oyuncu_vurgu"), label=[F("Calculation_oyuncu_etiket")], label_cull=False,
@@ -514,12 +523,12 @@ def design(directory: Path) -> Workbook:
             cx += w + 12
         return out
 
-    sub = f"TBL 2026-27 · 17 takım · {n_games} maç ({weeks[0]}–{weeks[1]}. hafta)"
+    sub = f"TBL {season} · {n_teams} takım · {n_games} maç ({weeks[0]}–{weeks[1]}. hafta)"
     dashboards = [
         Dashboard("Takımlar", frame(
             "Kim hücumda, kim savunmada iyi?", sub + " · Reytingler 100 hücum başına sayıdır",
             "Sağa gidildikçe hücum, yukarı gidildikçe savunma daha iyi. Bir takıma tıklayın, seçim tüm sayfalara geçer; "
-            "tekrar tıklayınca kalkar. 6–7 maçta reytinglerde ±5 puan şans payı vardır.", footer)
+            f"tekrar tıklayınca kalkar. {games_txt} maçta reytinglerde ±{rating_se} puan şans payı vardır.", footer)
             + controls(p_team, p_side, widths=[240, 160]) + [
             Zone("sheet", 16, 148, 760, 58, sheet=t1.name, show_title=False),
             Zone("sheet", 16, 212, 540, 562, sheet=t2.name),
@@ -536,7 +545,7 @@ def design(directory: Path) -> Workbook:
             Zone("sheet", 568, 148, 616, 330, sheet=s2.name),
             Zone("sheet", 568, 484, 616, 290, sheet=s3.name)]),
         Dashboard("Oyuncular", frame(
-            "Oyuncu ligde nerede duruyor?", "Yüzdelikler 100+ dakika oynayan oyuncular arasında · 0 en alt, 100 en üst",
+            "Oyuncu ligde nerede duruyor?", f"Yüzdelikler {qmin}+ dakika oynayan oyuncular arasında · 0 en alt, 100 en üst",
             "Soldaki çubuklar oyuncunun her metrikte ligdeki yüzdelik dilimi (50 = ortanca). Sağdaki grafikte bir oyuncuya "
             "tıklayın. On/off tek oyuncu için çok gürültülüdür.", footer)
             + controls(p_team, p_player, widths=[240, 300]) + [
@@ -563,9 +572,9 @@ def design(directory: Path) -> Workbook:
             Zone("sheet", 392, 590, 792, 184, sheet=m3.name)]),
         Dashboard("Yöntem", frame("Veri, yöntem ve sözlük", "Bu çalışma nasıl yapıldı, sayılar nasıl okunmalı", None,
                                   footer) + [
-            Zone("text", 16, 80, 370, 690, runs=method_veri(n_games, weeks)),
+            Zone("text", 16, 80, 370, 690, runs=method_veri(n_games, weeks, season, n_teams, span)),
             Zone("text", 410, 80, 370, 690, runs=method_sozluk()),
-            Zone("text", 804, 80, 380, 690, runs=method_orneklem())]),
+            Zone("text", 804, 80, 380, 690, runs=method_orneklem(games_txt, rating_se))]),
     ]
     actions = []
 
@@ -587,9 +596,9 @@ def design(directory: Path) -> Workbook:
     return Workbook(d, params, sources, sheets, dashboards, actions, start="Takımlar")
 
 
-def method_veri(n_games: int, weeks) -> list[tuple[str, dict]]:
+def method_veri(n_games: int, weeks, season: str, n_teams: int, span: str) -> list[tuple[str, dict]]:
     return [("Veri", T_H), NL, NL, (
-        f"TBL (Türkiye Basketbol Ligi) 2026-27 normal sezonu, {weeks[0]}–{weeks[1]}. hafta, {n_games} maç, 17 takım. "
+        f"TBL (Türkiye Basketbol Ligi) {season} {span}, {weeks[0]}–{weeks[1]}. hafta, {n_games} maç, {n_teams} takım. "
         "Kaynak: Türkiye Basketbol Federasyonu ve FIBA LiveStats'in kamuya açık maç verisi (oyun oyun kayıt, şut "
         "konumları, box score).", T_BODY), NL, NL, (
         "Hücumlar her olaydan tek tek sayıldı (Dean Oliver tanımı: hücum ribaundu hücumu uzatır). Reytingler 100 "
@@ -616,10 +625,10 @@ def method_sozluk() -> list[tuple[str, dict]]:
     return runs
 
 
-def method_orneklem() -> list[tuple[str, dict]]:
-    return [("Küçük örneklem uyarısı", T_H), NL, NL, (
-        "Takım başına 6–7 maç oynandı. Bir takımın reytingi ±5, 100 hücumluk bir ikilinin net reytingi ±15 kadar "
-        "şansla oynayabilir (1 standart hata). Clutch'ta takım başına birkaç düzine hücum vardır.", T_BODY), NL, NL, (
+def method_orneklem(games_txt: str, rating_se: int) -> list[tuple[str, dict]]:
+    return [("Örneklem uyarısı", T_H), NL, NL, (
+        f"Takım başına {games_txt} maç oynandı. Bir takımın reytingi ±{rating_se}, 100 hücumluk bir ikilinin net "
+        "reytingi ±15 kadar şansla oynayabilir (1 standart hata). Clutch'ta takım başına az hücum vardır.", T_BODY), NL, NL, (
         "Bu yüzden oranların yanında hücum, şut ya da dakika sayısı yazar; ipuçlarında şans payı verilir. Şut "
         "haritasında az şutlu altıgenler sıfıra çekilir.", T_BODY), NL, NL, (
         "xPTS modeli: lojistik regresyon, maç bazında 5 katlı çapraz doğrulama. Log loss 0,647 (bölge isabet "

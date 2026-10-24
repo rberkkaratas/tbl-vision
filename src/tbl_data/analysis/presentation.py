@@ -104,7 +104,7 @@ def augment(files: dict[str, pl.DataFrame], codes: dict[str, str]) -> dict[str, 
         sub = " · ".join(x for x in [r["nationality"], f"{int(r['age'])} yaş" if r["age"] else None,
                                      f"{r['games']} maç", f"{int(r['minutes'])} dk"] if x)
         if not r["qualified"]:
-            sub += " · 100 dk altı: yüzdelik yok"
+            sub += f" · {r['qualify_min']} dk altı: yüzdelik yok"
         for i, (label, col, fmt) in enumerate(card, 1):
             rows.append({"player": r["player"], "team": r["team_short"], "sub": sub, "metric": label, "metric_order": i,
                          "value_text": fmt(r[col])})
