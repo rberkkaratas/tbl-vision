@@ -33,14 +33,13 @@ def build_trips(match_id: int, events: list[dict]) -> tuple[list[dict], dict[int
     trips: list[dict] = []
     trip_of: dict[int, int] = {}
     used: set[int] = set()
-    open_trips: dict[tuple, dict] = {}  # (shooter, n) -> unfinished trip; a technical FT can interleave
     for i, e in enumerate(events):
         if e["action_type"] != "freethrow":
             continue
         m = _KOFN.fullmatch(e["sub_type"] or "")
         k, n = (int(m.group(1)), int(m.group(2))) if m else (1, 1)
-        cur = open_trips.get((e["player_id"], n))
-        if not (cur and k > 1 and k == cur["attempts"] + 1):
+        cur = _continued(trips, e, k, n) if k > 1 else None
+        if cur is None:
             foul = _find_foul(events, i, e, n, used)
             if foul:
                 used.add(foul["action_number"])
@@ -54,7 +53,6 @@ def build_trips(match_id: int, events: list[dict]) -> tuple[list[dict], dict[int
                 "first_seq": e["seq"],
             }
             trips.append(cur)
-            open_trips[(e["player_id"], n)] = cur
         cur["attempts"] += 1
         cur["made"] += int(e["success"])
         cur["last_seq"] = e["seq"]
@@ -62,6 +60,17 @@ def build_trips(match_id: int, events: list[dict]) -> tuple[list[dict], dict[int
     for t in trips:
         t["complete"] = t["attempts"] == t["n_awarded"]
     return trips, trip_of
+
+
+def _continued(trips: list[dict], ft: dict, k: int, n: int) -> dict | None:
+    """The unfinished trip that attempt k of n continues: the shooter's own (other trips can
+    interleave, e.g. a technical, or two fouls in one dead ball), else one a substitute finishes
+    in the same dead ball after the fouled player left (injury, disqualification)."""
+    cand = [t for t in reversed(trips) if t["team_season_id"] == ft["team_season_id"] and t["n_awarded"] == n
+            and t["attempts"] == k - 1 and t["period_ord"] == ft["period_ord"]]
+    own = [t for t in cand if t["shooter_id"] == ft["player_id"]]
+    sub = [t for t in cand if t["elapsed_s"] == ft["elapsed_s"]]
+    return (own or sub or [None])[0]
 
 
 def _find_foul(events: list[dict], i: int, ft: dict, n: int, used: set[int]) -> dict | None:

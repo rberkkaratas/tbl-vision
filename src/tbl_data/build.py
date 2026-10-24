@@ -2,11 +2,19 @@
 
 Genius is canonical for box score, events and shots; TBF for ids, names, officials,
 video. Genius players are tied to TBF person ids through (team, jersey), which is
-unique within a team in every match (checked in validate.player_mapping).
+unique within a team in every match (checked in validate.player_mapping). Where TBF has
+no jersey (early 2025-26 games) or it differs, the name decides: same team and game, same
+surname ("I. Pinarer" = "İbrahim Pınarer"; the first initial breaks ties), and only if
+exactly one TBF player of that team fits. A player Genius has but TBF's box score lacks
+(a TBF omission) gets a stable negative id from his team and name, so lineups and box
+scores stay whole; he is listed in players with the Genius name only.
 """
 
 from __future__ import annotations
 
+import re
+import unicodedata
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +46,7 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
     drift = Drift()
     rows: dict[str, list[dict]] = {name: [] for name in schemas.TABLES}
     unmapped: list[dict] = []
+    synthetic: dict[int, dict] = {}  # negative id -> players row for players TBF does not list
 
     phases = {int(w["sezon_Hafta"]): w.get("devre_Deger")
               for w in T.data(reader.get("tbf", "league_weeks", str(season.league_id))) or []}
@@ -73,14 +82,27 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
         # TBF box: the bridge from (team, jersey) to persistent person id
         tbf_box = T.box_rows(box_doc, match_id, home, away, drift)
         rows["tbf_box"] += tbf_box
-        by_jersey = {(r["team_season_id"], r["jersey"]): r["player_id"] for r in tbf_box}
+        by_jersey = {(r["team_season_id"], r["jersey"]): r["player_id"] for r in tbf_box if r["jersey"]}
+        players = [p | {"team": team_of[p.pop("tno")]} for p in G.player_rows(g, match_id, drift)]
+        mapped = {i: by_jersey.get((p["team"], p["jersey"])) for i, p in enumerate(players)}
+        taken = {v for v in mapped.values() if v}
+        for i, p in enumerate(players):
+            if mapped[i] is None:
+                mapped[i] = _match_by_name(p["name"], [r for r in tbf_box if r["team_season_id"] == p["team"]
+                                                       and r["player_id"] not in taken])
+                if mapped[i]:
+                    taken.add(mapped[i])
 
         pid_of: dict[tuple[int, int], int] = {}
-        for p in G.player_rows(g, match_id, drift):
-            team = team_of[p.pop("tno")]
-            pid = by_jersey.get((team, p["jersey"]))
-            if pid is None:
-                unmapped.append({"match_id": match_id, "team_season_id": team, "jersey": p["jersey"], "name": p["name"]})
+        for i, p in enumerate(players):
+            team, pid = p.pop("team"), mapped[i]
+            if pid is None and (p.get("seconds") or 0) > 0:  # played, but TBF's box score lacks him
+                pid = -(zlib.crc32(f"{team}|{' '.join(_fold(p['name']))}".encode()) % 1_000_000_000)
+                synthetic.setdefault(pid, {"player_id": pid, "full_name": p["name"], "team_season_id": team,
+                                           "jersey": p["jersey"]})
+                unmapped.append({"match_id": match_id, "team_season_id": team, "jersey": p["jersey"],
+                                 "name": p["name"], "player_id": pid})
+            if pid is None:  # did not play: no stats to keep
                 continue
             pid_of[(team, p["pno"])] = pid
             rows["match_players"].append(p | {"team_season_id": team, "player_id": pid})
@@ -114,8 +136,29 @@ def build(reader: RawReader, season: Season, played_ids: list[tuple[int, int | N
         if doc := reader.get("tbf", "match_shotchart", mid):
             rows["tbf_shots"] += T.shotchart_rows(doc, match_id, drift)
 
+    # FIBA forfeit: the official result is 20-0 while Genius keeps the game as played. Analysis
+    # uses the played score; matches keeps the official one
+    played_pts = {(r["match_id"], r["team_season_id"]): r["pts"] for r in rows["match_teams"]}
+    for m in rows["matches"]:
+        m["forfeit"] = ({m["home_score"], m["away_score"]} == {20, 0}
+                        and played_pts.get((m["match_id"], m["home_team_id"])) != m["home_score"])
+
     rows["teams"] = T.team_rows(reader.get("tbf", "teams", str(season.league_id)), drift)
     rows["players"] = _players(reader, season, drift, {r["club_id"]: r["team_season_id"] for r in rows["teams"]})
+    # a player TBF omitted from one game's box score but lists elsewhere in the season (often after a
+    # transfer): if his name is unique across the season's TBF box scores, use that person id
+    season_ids: dict[tuple, set] = {}
+    for r in rows["tbf_box"]:
+        season_ids.setdefault(tuple(_fold(r["name"] or "")), set()).add(r["player_id"])
+    remap = {neg: ids.pop() for neg, row in synthetic.items()
+             if len(ids := set(season_ids.get(tuple(_fold(row["full_name"])), set()))) == 1}
+    if remap:
+        for table in ("match_players", "events", "shots"):
+            for r in rows[table]:
+                if r.get("player_id") in remap:
+                    r["player_id"] = remap[r["player_id"]]
+    rows["players"] += [r for neg, r in synthetic.items() if neg not in remap]
+    unmapped = [u for u in unmapped if u.pop("player_id", None) not in remap]
     for rid, doc in reader.iter("tbf", "player_profile"):
         rows["player_career"] += T.career_rows(doc, int(rid), drift)
 
@@ -201,3 +244,30 @@ def refresh_views(root: Path) -> None:
                             "hive_partitioning = true, union_by_name = true)")
     finally:
         con.close()
+
+
+_SUFFIX = {"jr", "sr", "ii", "iii", "iv"}
+
+
+def _fold(name: str) -> list[str]:
+    """'İbrahim Pınarer' -> ['ibrahim', 'pinarer']: lower case, no accents, no suffixes."""
+    name = name.replace("İ", "I").replace("ı", "i")
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return [t for t in re.split(r"[^a-z]+", name) if t and t not in _SUFFIX]
+
+
+def _match_by_name(genius_name: str, candidates: list[dict]) -> int | None:
+    """Genius 'I. Pinarer' against TBF full names of one team in one game; None unless unique."""
+    g = _fold(genius_name or "")
+    if not g:
+        return None
+    folded = {c["player_id"]: t for c in candidates if (t := _fold(c.get("name") or ""))}
+    for surname in reversed(g[1:]):  # the last name first; "Medley-Bacon" also tries "Medley"
+        same = {pid: t for pid, t in folded.items() if surname in t[1:]}
+        if len(same) == 1:  # first names vary between sources ("Emin" / "Muhammed Emin")
+            return next(iter(same))
+        if same:  # several with that surname: a first name (or initial) shared with Genius decides
+            hits = {pid for pid, t in same.items() if t[0] in g[:-1]} or \
+                   {pid for pid, t in same.items() if t[0][0] == g[0][0]}
+            return hits.pop() if len(hits) == 1 else None
+    return None

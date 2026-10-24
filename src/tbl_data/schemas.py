@@ -70,6 +70,7 @@ class Matches(pa.DataFrameModel):
     away_team_id: Int
     home_score: Int = Count()
     away_score: Int = Count()
+    forfeit: bool  # official 20-0 result for a game that was played (scores above are official)
     n_overtimes: Int = Count()
     period_minutes: Int = Opt()
     overtime_minutes: Int = Opt()

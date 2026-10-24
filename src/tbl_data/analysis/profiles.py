@@ -86,6 +86,14 @@ def team_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFr
     return out, start.join(lg, on="start_type", how="left")
 
 
+def player_names(staged: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """player_id -> one name: TBF's full name (Genius spells a player differently from game to
+    game); the Genius spelling for the few players missing from TBF's season player list."""
+    tbf = staged["players"].select("player_id", player="full_name").unique("player_id")
+    genius = staged["match_players"].sort("match_id").select("player_id", player="name").unique("player_id", keep="last")
+    return pl.concat([tbf, genius.join(tbf, on="player_id", how="anti")])
+
+
 def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame],
                     shooting: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     """-> (one row per player and team, long percentile table for qualified players)."""
@@ -126,7 +134,7 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         on_opp_dreb=(~own & (a == "rebound") & (sub == "defensive")).sum(),
         on_opp_fg2a=(~own & (a == "2pt")).sum())
 
-    names = staged["players"].select("player_id", player="full_name").unique("player_id")  # TBF: one spelling
+    names = player_names(staged)
     season_start = staged["matches"]["start_utc"].min().date()  # ages at the season's first game
     info = staged["players"].select("player_id", "nationality", "birth_date").unique("player_id").with_columns(
         age=((pl.lit(season_start) - pl.col("birth_date")).dt.total_days() / 365.25).round(1))

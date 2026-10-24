@@ -7,7 +7,7 @@ from tbl_data.enrich import enrich
 from tbl_data.enrich.ft_trips import build_trips
 from tbl_data.enrich.order import apply_overrides, order_events
 from tbl_data.enrich.possessions import build_possessions
-from tbl_data.enrich.shots import locate, zone
+from tbl_data.enrich.shots import attack_ends, locate, zone
 
 H, A = 1, 2  # team ids in synthetic games
 
@@ -74,6 +74,28 @@ def test_trip_survives_interleaved_technical():
     ])
     assert [(t["shooter_id"], t["attempts"], t["trip_type"], t["complete"]) for t in trips] == [
         (10, 2, "shooting_2pt", True), (11, 1, "technical", True)]
+
+
+def test_trips_with_two_fouls_and_a_substitute_shooter():
+    # personal + technical + disqualifying in one dead ball (304335), then an injured shooter replaced (304219)
+    _, trips, _, _ = run([
+        ev(1, 0, "period", "start"),
+        ev(2, 5, "foul", "personal", A, 20, q=["2freethrow"]),
+        ev(3, 5, "foul", "technical", A, 20, q=["1freethrow"]),
+        ev(4, 5, "foul", "disqualifying", A, 20, q=["2freethrow"]),
+        ev(5, 5, "freethrow", "1of2", H, 10),
+        ev(6, 5, "freethrow", "1of2", H, 10),
+        ev(7, 5, "freethrow", "2of2", H, 10),
+        ev(8, 5, "freethrow", "1of1", H, 10, ok=False),
+        ev(9, 5, "freethrow", "2of2", H, 10),
+        ev(10, 30, "foul", "personal", A, 21, q=["shooting", "2freethrow"]),
+        ev(11, 30, "freethrow", "1of2", H, 12, ok=False),
+        ev(12, 30, "substitution", "out", H, 12),
+        ev(13, 30, "substitution", "in", H, 13),
+        ev(14, 30, "freethrow", "2of2", H, 13),
+    ])
+    assert [(t["shooter_id"], t["attempts"], t["complete"]) for t in trips] == [
+        (10, 2, True), (10, 2, True), (10, 1, True), (12, 2, True)]
 
 
 def test_possession_rules():
@@ -181,6 +203,15 @@ def test_shot_location_rotates_far_end():
     assert locate({"x": 6.0, "y": 50.0, "shot_type": "2pt", "sub_type": "tipinlayup"}, False)["location_imputed"]
     assert zone("3pt", 1.0, 0.5, 7.0) == "corner_3" and zone("3pt", 20.0, 7.5, 18.4) == "heave"
     assert zone("2pt", 4.0, 7.5, 2.4) == "paint" and zone("2pt", 6.5, 3.0, 6.5) == "midrange"
+    assert zone("3pt", 0.9, 0.91, 6.6) == "corner_3"  # pin snapped onto the corner line
+
+
+def test_attack_end_follows_a_mirrored_period():
+    def shots(team, period, x, n=6):
+        return [{"team_season_id": team, "period_ord": period, "x": x} for _ in range(n)]
+    # H attacks the low end in Q1, Q3-Q4 is the high end; the scorer mirrored Q2
+    ends = attack_ends(shots(H, 1, 10) + shots(H, 2, 90, 5) + shots(H, 3, 90) + shots(H, 4, 90, 2))
+    assert ends == {(H, 1): False, (H, 2): True, (H, 3): True, (H, 4): True}
 
 
 @needs_fixtures

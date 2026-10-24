@@ -3,7 +3,9 @@
 Genius x/y are 0-100 of the full 28 x 15 m court, not normalised to one basket: a team
 attacks one end in the first half and the other in the second half (overtime keeps the
 second-half end). We find each team's end per half from the majority of its shots, so a
-few heaves from the far half do not flip it, then rotate shots at the x>50 end by 180°
+few heaves from the far half do not flip it; a period whose own shots clearly sit at the
+other end overrides that (the scorer mirrored one quarter: 304391 Q2, 2025-26). Then
+rotate shots at the x>50 end by 180°
 (x' = 100-x, y' = 100-y) so every shot is measured from the attacked baseline.
 FIBA geometry: basket centre 1.575 m from the baseline on the centre line, 3pt arc
 6.75 m, straight corner segments 0.90 m from the sidelines up to 2.99 m from the baseline.
@@ -19,22 +21,33 @@ from .ft_trips import trip_after_shot
 COURT_X, COURT_Y = 28.0, 15.0
 RIM_X, RIM_Y = 1.575, 7.5
 CORNER_X = 2.99  # where the corner 3pt straight line meets the arc
-CORNER_Y = 0.90
 PAINT_X, PAINT_HALF_W = 5.80, 2.45
 RIM_R = 1.25
 IMPUTED_SPOTS = {(6.0, 50.0), (94.0, 50.0)}  # Genius' default spot for tip-ins
 
 
+MIN_PERIOD_SHOTS = 5  # a period needs this many shots, most at one end, to override its half
+
+
+def _half(period_ord: int) -> int:
+    return 1 if period_ord <= 2 else 2
+
+
 def attack_ends(shots: list[dict]) -> dict[tuple[int, int], bool]:
-    """(team, half) -> True if the team attacks the x>50 basket. half: 1 = Q1-Q2, 2 = Q3+."""
+    """(team, period_ord) -> True if the team attacks the x>50 basket in that period."""
     votes: dict[tuple[int, int], Counter] = {}
+    by_period: dict[tuple[int, int], Counter] = {}
     for s in shots:
-        key = (s["team_season_id"], 1 if s["period_ord"] <= 2 else 2)
-        votes.setdefault(key, Counter())[s["x"] > 50] += 1
-    ends = {k: v.most_common(1)[0][0] for k, v in votes.items()}
+        votes.setdefault((s["team_season_id"], _half(s["period_ord"])), Counter())[s["x"] > 50] += 1
+        by_period.setdefault((s["team_season_id"], s["period_ord"]), Counter())[s["x"] > 50] += 1
+    halves = {k: v.most_common(1)[0][0] for k, v in votes.items()}
     # a team with shots in only one half attacks the other end in the other half
-    for (team, half), high in list(ends.items()):
-        ends.setdefault((team, 3 - half), not high)
+    for (team, half), high in list(halves.items()):
+        halves.setdefault((team, 3 - half), not high)
+    ends = {}
+    for (team, period), v in by_period.items():
+        (high, n), = v.most_common(1)
+        ends[(team, period)] = high if n >= MIN_PERIOD_SHOTS and n > v.total() / 2 else halves[(team, _half(period))]
     return ends
 
 
@@ -42,7 +55,9 @@ def zone(shot_type: str, x_m: float, y_m: float, dist: float) -> str:
     if x_m > COURT_X / 2:
         return "heave"
     if shot_type == "3pt":
-        return "corner_3" if x_m <= CORNER_X and (y_m < CORNER_Y or y_m > COURT_Y - CORNER_Y) else "above_break_3"
+        # within CORNER_X of the baseline a three can only come from a corner strip; pins snapped
+        # onto the corner line (y = 0.91 m) would otherwise read as above the break
+        return "corner_3" if x_m <= CORNER_X else "above_break_3"
     if dist <= RIM_R:
         return "rim"
     if x_m <= PAINT_X and abs(y_m - RIM_Y) <= PAINT_HALF_W:
@@ -87,7 +102,7 @@ def enrich_shots(shots: list[dict], events: list[dict], trips: list[dict], trip_
     out = []
     for s in shots:
         e = by_an.get(s["action_number"])
-        r = dict(s) | locate(s, ends[(s["team_season_id"], 1 if s["period_ord"] <= 2 else 2)])
+        r = dict(s) | locate(s, ends[(s["team_season_id"], s["period_ord"])])
         q = set(e["qualifiers"]) if e else set()
         a, b = linked.get(s["action_number"], {}).get("assist"), linked.get(s["action_number"], {}).get("block")
         r |= {

@@ -14,6 +14,7 @@ from pathlib import Path
 import polars as pl
 
 from .presentation import augment, team_codes
+from .profiles import player_names
 
 COURT_W, HALF_L = 15.0, 14.0
 RIM = (7.5, 1.575)
@@ -93,11 +94,6 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
 
     build_workbook(out, out / f"{out.name}.twb")
     return {k: v.height for k, v in files.items()}
-
-
-def player_names(staged: dict[str, pl.DataFrame]) -> pl.DataFrame:
-    """player_id -> one name: TBF's full name (Genius spells a player differently from game to game)."""
-    return staged["players"].select("player_id", player="full_name").unique("player_id")
 
 
 def four_factors(teams: pl.DataFrame) -> pl.DataFrame:

@@ -4,7 +4,8 @@ The definitions follow FIBA LiveStats, whose own per-game numbers (match_teams
 biggest_lead, biggest_run, lead_changes, times_tied, time_leading_s) are the check:
   - a lead change is a team going ahead after the other one led (a tie in between does
     not reset it); a tie is the score becoming level after 0-0, and a period that starts
-    level counts as another one;
+    level counts as another one (Genius counts most of these, but not all: 2025-26 has 14
+    games where it skips one or more, so ties_at_break bounds the check);
   - a run is the points one team scores in a row while the other scores none;
   - clutch (NBA definition): the last 5 minutes of the 4th quarter or overtime with the
     margin at 5 or less when the possession starts.
@@ -58,7 +59,7 @@ def game_flow(timeline: pl.DataFrame, match_teams: pl.DataFrame) -> tuple[pl.Dat
         rs = list(g.iter_rows(named=True))
         side = {True: {"biggest_lead": 0, "lead_changes": 0, "time_leading_s": 0.0, "biggest_run": 0},
                 False: {"biggest_lead": 0, "lead_changes": 0, "time_leading_s": 0.0, "biggest_run": 0}}
-        ties, leader, last_leader, prev_t, period = 0, None, None, 0.0, 1
+        ties, at_break, leader, last_leader, prev_t, period = 0, 0, None, None, 0.0, 1
         run: list[dict] = []  # consecutive scoring rows of one side
         for r in rs:
             if leader is not None:  # the previous score stood until now
@@ -69,6 +70,7 @@ def game_flow(timeline: pl.DataFrame, match_teams: pl.DataFrame) -> tuple[pl.Dat
             if r["period_ord"] != period:
                 if leader is None and last_leader is not None:  # level at the break
                     ties += 1
+                    at_break += 1
                 period = r["period_ord"]
             m = r["margin_home"]
             leader = None if m == 0 else m > 0
@@ -92,7 +94,7 @@ def game_flow(timeline: pl.DataFrame, match_teams: pl.DataFrame) -> tuple[pl.Dat
             sign = 1 if home else -1
             flow.append({"match_id": match_id, "team_season_id": sides[(match_id, home)],
                          "opponent_id": sides[(match_id, not home)], "is_home": home, "pts": own, "opp_pts": opp,
-                         "won": own > opp, **side[home], "times_tied": ties,
+                         "won": own > opp, **side[home], "times_tied": ties, "ties_at_break": at_break,
                          "largest_deficit": max(0, *(-sign * r["margin_home"] for r in rs))})
     f = pl.DataFrame(flow).with_columns(pl.col("time_leading_s").round(1),
                                          lead_changes_game=pl.col("lead_changes").sum().over("match_id"))

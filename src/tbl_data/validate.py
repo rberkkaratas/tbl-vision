@@ -27,8 +27,10 @@ def run_all(t: dict[str, pl.DataFrame], drift: pl.DataFrame, unmapped: list[dict
         box_tbf_vs_genius(t),
         minutes_tbf_vs_genius(t),
         player_mapping(t, unmapped),
+        mapped_names(t),
         tbf_quirks(t),
         team_points(t),
+        forfeits(t),
         period_scores(t),
         shots_vs_fga(t),
         tbf_shots_vs_genius(t),
@@ -49,7 +51,10 @@ def _box_join(t) -> pl.DataFrame:
 
 
 def box_tbf_vs_genius(t) -> Check:
-    """Every counting stat of every player equal in Genius and TBF."""
+    """Every counting stat of every player equal in Genius and TBF. Genius is kept: TBF's box
+    is sometimes stale (2025-26 week 1: points missing for whole teams) or lacks fouls drawn /
+    shots blocked, and a basket is occasionally credited to a teammate. A wrong (team, jersey)
+    mapping shows up in mapped_names instead."""
     j = _box_join(t)
     diffs = [
         j.filter(pl.col(c).ne_missing(pl.col(f"{c}_tbf")))
@@ -57,8 +62,8 @@ def box_tbf_vs_genius(t) -> Check:
                 pl.col(c).cast(pl.Int64).alias("genius"), pl.col(f"{c}_tbf").cast(pl.Int64).alias("tbf"))
         for c in COUNTING
     ]
-    return Check("box_tbf_vs_genius", f"{len(COUNTING)} counting stats x player equal in both sources",
-                 j.height * len(COUNTING), pl.concat(diffs))
+    return Check("box_tbf_vs_genius", f"{len(COUNTING)} counting stats x player equal in both sources (informational)",
+                 j.height * len(COUNTING), pl.concat(diffs), blocking=False)
 
 
 def minutes_tbf_vs_genius(t) -> Check:
@@ -71,15 +76,29 @@ def minutes_tbf_vs_genius(t) -> Check:
 
 
 def player_mapping(t, unmapped) -> Check:
-    """Every Genius player has a TBF id, every TBF box row a Genius row."""
+    """Every Genius player who played has a TBF id, every TBF box row of a player who played a Genius row
+    (TBF also lists unused players, often without a jersey; Genius may not)."""
     g, b = t["match_players"], t["tbf_box"]
-    only_tbf = b.join(g, on=["match_id", "player_id"], how="anti").select(
+    only_tbf = b.filter(pl.col("seconds") > 0).join(g, on=["match_id", "player_id"], how="anti").select(
         "match_id", "team_season_id", "jersey", "name", pl.lit("tbf_only").alias("side"))
     only_g = pl.DataFrame(unmapped, schema={"match_id": pl.Int32, "team_season_id": pl.Int32,
                                             "jersey": pl.String, "name": pl.String}
                           ).with_columns(pl.lit("genius_only").alias("side"))
     return Check("player_mapping", "Genius (team, jersey) <-> TBF person id is 1:1", g.height + b.height,
                  pl.concat([only_tbf, only_g]))
+
+
+def mapped_names(t) -> Check:
+    """Every (team, jersey) match joins two names that share a word (ASCII-folded, so İ/ı and
+    accents do not matter): a wrong jersey would join two different players."""
+    from .build import _fold
+
+    j = t["match_players"].select("match_id", "player_id", "jersey", "name").join(
+        t["tbf_box"].select("match_id", "player_id", pl.col("name").alias("name_tbf")), on=["match_id", "player_id"])
+    share = pl.struct("name", "name_tbf").map_elements(
+        lambda r: bool(set(_fold(r["name"] or "")) & set(_fold(r["name_tbf"] or ""))), return_dtype=pl.Boolean)
+    return Check("mapped_names", "Genius and TBF names of each mapped player share a word", j.height,
+                 j.filter(~share))
 
 
 def tbf_quirks(t) -> Check:
@@ -94,19 +113,30 @@ def tbf_quirks(t) -> Check:
 
 
 def team_points(t) -> Check:
-    """Sum of player points = Genius team points = TBF final score."""
-    p = t["match_players"].group_by("match_id", "team_season_id").agg(player_pts=pl.col("pts").sum())
-    m = t["matches"]
+    """Sum of player points = Genius team points = TBF final score (forfeits: see forfeits)."""
+    m = t["matches"].filter(~pl.col("forfeit"))
+    p = t["match_players"].join(m.select("match_id"), on="match_id").group_by("match_id", "team_season_id").agg(
+        player_pts=pl.col("pts").sum())
     final = pl.concat([
         m.select("match_id", pl.col("home_team_id").alias("team_season_id"), pl.col("home_score").alias("final")),
         m.select("match_id", pl.col("away_team_id").alias("team_season_id"), pl.col("away_score").alias("final")),
     ])
-    j = (t["match_teams"].select("match_id", "team_season_id", pl.col("pts").alias("team_pts"))
+    j = (t["match_teams"].join(m.select("match_id"), on="match_id")
+         .select("match_id", "team_season_id", pl.col("pts").alias("team_pts"))
          .join(p, on=["match_id", "team_season_id"], how="full", coalesce=True)
          .join(final, on=["match_id", "team_season_id"], how="full", coalesce=True))
     bad = j.filter((pl.col("team_pts") != pl.col("player_pts")) | (pl.col("team_pts") != pl.col("final"))
                    | pl.any_horizontal(pl.col("team_pts", "player_pts", "final").is_null()))
     return Check("team_points", "player sum = team total = TBF final score", j.height, bad)
+
+
+def forfeits(t) -> Check:
+    """Games played but officially scored 20-0 (e.g. an ineligible player). Analysis uses the
+    played score; matches keeps the official one."""
+    m = t["matches"]
+    return Check("forfeits", "games scored 20-0 officially but played (informational)", m.height,
+                 m.filter(pl.col("forfeit")).select("match_id", "week", "home_team_id", "away_team_id",
+                                                    "home_score", "away_score"), blocking=False)
 
 
 def period_scores(t) -> Check:
@@ -165,9 +195,14 @@ def events_vs_box(t) -> Check:
                  pl.concat(diffs))
 
 
+# entries the scorer can add or renumber after TBF's copy was taken (304218, 2025-26)
+TBF_ADMIN_EVENTS = ("Maç Sonu", "Head Coach Challenge")
+
+
 def tbf_events_subset(t) -> Check:
     """Every TBF game-flow action number exists in the Genius play-by-play."""
-    j = t["tbf_events"].join(t["events"].select("match_id", "action_number"), on=["match_id", "action_number"], how="anti")
+    j = t["tbf_events"].join(t["events"].select("match_id", "action_number"), on=["match_id", "action_number"], how="anti"
+                             ).filter(~pl.col("text").is_in(TBF_ADMIN_EVENTS))
     return Check("tbf_events_subset", "TBF game-flow actions are a subset of Genius pbp", t["tbf_events"].height,
                  j.select("match_id", "action_number", "text"))
 
@@ -202,6 +237,7 @@ def run_enriched(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame]) -> list
         ft_trips_vs_box(s, e),
         ft_trip_fouls(e),
         attack_ends(e),
+        attack_switch(e),
         shot_zones(e),
         Check("enrich_issues", "order/lineup/possession anomalies logged in enrich_issues (informational)",
               e["events_enriched"].height, e["enrich_issues"].filter(pl.col("source") != "override"), blocking=False),
@@ -291,12 +327,17 @@ def possession_attribution(e) -> Check:
 
 
 def possession_balance(s, e) -> Check:
-    """Possessions alternate, so in each period the two teams' counts differ by at most one."""
+    """Possessions alternate, so in each period the two teams' counts differ by at most one,
+    plus one per logged possession_switch_without_end (a missing turnover or rebound in the feed)."""
     p = e["possessions"].join(s["match_teams"].select("match_id", "team_season_id", "is_home"),
                               on=["match_id", "team_season_id"])
     j = p.group_by("match_id", "period_ord").agg(home=pl.col("is_home").sum(), away=(~pl.col("is_home")).sum())
-    return Check("possession_balance", "|home - away possessions| <= 1 in every period", j.height,
-                 j.filter((pl.col("home").cast(pl.Int64) - pl.col("away").cast(pl.Int64)).abs() > 1))
+    gaps = (e["enrich_issues"].filter(pl.col("issue") == "possession_switch_without_end")
+            .join(e["events_enriched"].select("match_id", "action_number", "period_ord"), on=["match_id", "action_number"])
+            .group_by("match_id", "period_ord").agg(feed_gaps=pl.len()))
+    j = j.join(gaps, on=["match_id", "period_ord"], how="left").with_columns(pl.col("feed_gaps").fill_null(0))
+    return Check("possession_balance", "|home - away possessions| <= 1 (+ feed gaps) in every period", j.height,
+                 j.filter((pl.col("home").cast(pl.Int64) - pl.col("away").cast(pl.Int64)).abs() > 1 + pl.col("feed_gaps")))
 
 
 def possessions_vs_estimate(s, e) -> Check:
@@ -328,28 +369,57 @@ def ft_trip_fouls(e) -> Check:
                                                                    "n_awarded", "trip_type"), blocking=False)
 
 
-def attack_ends(e) -> Check:
-    """In every half the two teams shoot at opposite baskets and switch at half-time
-    (majority of shots per team and half, in raw feed coordinates)."""
+def _ends(e, by: str) -> pl.DataFrame:
+    """Majority attacked end per team and period/half, in raw feed coordinates."""
     sh = e["shots_enriched"].filter(~pl.col("location_imputed")).with_columns(
         half=pl.when(pl.col("period_ord") <= 2).then(1).otherwise(2), high=pl.col("x") > 50)
-    ends = sh.group_by("match_id", "team_season_id", "half").agg(high=pl.col("high").mean() > 0.5)
-    by_half = ends.group_by("match_id", "half").agg(n=pl.len(), opposite=pl.col("high").n_unique() == 2)
-    by_team = ends.group_by("match_id", "team_season_id").agg(n=pl.len(), switched=pl.col("high").n_unique() == 2)
-    bad = pl.concat([by_half.filter((pl.col("n") == 2) & ~pl.col("opposite")).select("match_id", what=pl.lit("same end")),
-                     by_team.filter((pl.col("n") == 2) & ~pl.col("switched")).select("match_id", what=pl.lit("no switch"))])
-    return Check("attack_ends", "teams attack opposite ends and switch at half-time", ends.height, bad)
+    return sh.group_by("match_id", "team_season_id", by).agg(high=pl.col("high").mean() > 0.5)
+
+
+def attack_ends(e) -> Check:
+    """In every period the two teams shoot at opposite baskets, and every shot is measured from
+    the end its team attacked (shots_enriched: almost no heaves in a team's period)."""
+    ends = _ends(e, "period_ord")
+    by_period = ends.group_by("match_id", "period_ord").agg(n=pl.len(), opposite=pl.col("high").n_unique() == 2)
+    heaves = e["shots_enriched"].group_by("match_id", "team_season_id", "period_ord").agg(
+        n=pl.len(), heaves=(pl.col("zone") == "heave").sum())
+    bad = pl.concat([by_period.filter((pl.col("n") == 2) & ~pl.col("opposite")).select("match_id", "period_ord",
+                                                                                       what=pl.lit("same end")),
+                     heaves.filter((pl.col("n") >= 5) & (pl.col("heaves") > pl.col("n") / 2)).select(
+                         "match_id", "period_ord", what=pl.lit("measured from the wrong end"))])
+    return Check("attack_ends", "teams attack opposite ends; shots measured from the attacked end", ends.height, bad)
+
+
+def attack_switch(e) -> Check:
+    """Teams switch ends at half-time in the raw feed. A failure is a scorer who mirrored a
+    period; shots.attack_ends follows the period's own shots there."""
+    ends = _ends(e, "period_ord").with_columns(half=pl.when(pl.col("period_ord") <= 2).then(1).otherwise(2))
+    first = ends.filter(pl.col("period_ord") == 1).select("match_id", "team_season_id", pl.col("high").alias("q1"))
+    bad = ends.join(first, on=["match_id", "team_season_id"]).filter(
+        (pl.col("high") == pl.col("q1")) != (pl.col("half") == 1))
+    return Check("attack_switch", "teams keep their end within a half and switch at half-time (informational)",
+                 ends.height, bad.select("match_id", "team_season_id", "period_ord"), blocking=False)
+
+
+ON_LINE_M = 0.10  # pins this close to the 3pt line are ambiguous (Genius snaps corner shots to y = 6.05)
+MISPLACED_PIN_RATE = 0.001  # more 2pt/3pt disagreements than this point at our geometry, not the scorer
 
 
 def shot_zones(e) -> Check:
-    """The scorer's 2pt/3pt call agrees with the FIBA line at the recorded spot
-    (corner strips 0.90 m from the sidelines up to 2.99 m, arc 6.75 m elsewhere)."""
+    """The scorer's 2pt/3pt call agrees with the FIBA line at the recorded spot (corner strips
+    0.90 m from the sidelines up to 2.99 m, arc 6.75 m elsewhere), for pins clear of the line.
+    A few pins are simply misplaced (304227, 2025-26: two 2pt shots pinned 7 m out); only a
+    rate above MISPLACED_PIN_RATE blocks."""
     sh = e["shots_enriched"].filter((pl.col("zone") != "heave") & ~pl.col("location_imputed"))
-    corner = (pl.col("x_m") <= 2.99) & ((pl.col("y_m") < 0.9) | (pl.col("y_m") > 14.1))
+    side = pl.min_horizontal(pl.col("y_m"), 15 - pl.col("y_m"))
+    corner = (pl.col("x_m") <= 2.99) & (side < 0.9)
     beyond = corner | ((pl.col("x_m") > 2.99) & (pl.col("distance_m") > 6.75))
-    bad = sh.filter((pl.col("shot_type") == "3pt") != beyond)
+    on_line = pl.when(pl.col("x_m") <= 2.99).then((side - 0.9).abs()).otherwise(
+        (pl.col("distance_m") - 6.75).abs()) <= ON_LINE_M
+    bad = sh.filter(((pl.col("shot_type") == "3pt") != beyond) & ~on_line)
     return Check("shot_zones", "2pt/3pt call matches the FIBA 3pt line at the shot location", sh.height,
-                 bad.select("match_id", "action_number", "shot_type", "zone", "distance_m", "x_m", "y_m"))
+                 bad.select("match_id", "action_number", "shot_type", "zone", "distance_m", "x_m", "y_m"),
+                 blocking=bad.height > MISPLACED_PIN_RATE * sh.height)
 
 
 # -- analysis layer -------------------------------------------------------------------
@@ -365,16 +435,18 @@ def game_flow_vs_genius(s, a) -> Check:
         "match_id", "team_season_id", g_lead="biggest_lead", g_run="biggest_run", g_lc="lead_changes",
         g_tied="times_tied", g_tl="time_leading_s"), on=["match_id", "team_season_id"])
     bad = g.filter((pl.col("biggest_lead") != pl.col("g_lead")) | (pl.col("biggest_run") != pl.col("g_run"))
-                   | (pl.col("lead_changes_game") != pl.col("g_lc")) | (pl.col("times_tied") != pl.col("g_tied"))
+                   | (pl.col("lead_changes_game") != pl.col("g_lc"))
+                   | ~pl.col("g_tied").is_between(pl.col("times_tied") - pl.col("ties_at_break"), pl.col("times_tied"))
                    | ((pl.col("time_leading_s") - pl.col("g_tl")).abs() > 2))
-    return Check("game_flow_vs_genius", "biggest lead/run, lead changes, ties, time leading (2 s) = Genius", g.height,
+    return Check("game_flow_vs_genius", "biggest lead/run, lead changes, ties (± level breaks), time leading (2 s) = Genius", g.height,
                  bad.select("match_id", "team_season_id", "biggest_lead", "g_lead", "biggest_run", "g_run",
                             "times_tied", "g_tied", "time_leading_s", "g_tl"))
 
 
 def score_timeline_final(s, a) -> Check:
     last = a["score_timeline"].sort("seq").group_by("match_id").last()
-    j = last.join(s["matches"].select("match_id", "home_score", "away_score"), on="match_id", suffix="_official")
+    j = last.join(s["matches"].filter(~pl.col("forfeit")).select("match_id", "home_score", "away_score"),
+                  on="match_id", suffix="_official")
     return Check("score_timeline_final", "score timeline ends on the official final score", j.height,
                  j.filter((pl.col("home_score") != pl.col("home_score_official"))
                           | (pl.col("away_score") != pl.col("away_score_official"))))
@@ -423,12 +495,13 @@ def team_profile_totals(s, a) -> Check:
 
 
 def player_on_court_totals(e, a) -> Check:
-    """Each team possession is on five players' records; usage averages 20% on court."""
+    """Each team possession is on every on-court player's record (five; Genius' own feed keeps
+    six on court for a half in 304241, 2025-26, and so do we); usage averages 20% on court."""
     p = a["player_profiles"]
-    n = e["possessions"].group_by("team_season_id").agg(n=pl.len())
+    n = e["stints"].group_by("team_season_id").agg(n=(pl.col("lineup").list.len() * pl.col("poss_for")).sum())
     j = p.group_by("team_season_id").agg(
         on=pl.col("on_poss_for").sum(),
         usg=(pl.col("usg") * pl.col("on_team_plays")).sum() / pl.col("on_team_plays").sum()).join(n, on="team_season_id")
-    bad = j.filter((pl.col("on") != 5 * pl.col("n")) | ~pl.col("usg").is_between(0.19, 0.21))
-    return Check("player_on_court_totals", "players' on-court possessions = 5 x team's; usage averages 19-21%",
+    bad = j.filter((pl.col("on") != pl.col("n")) | ~pl.col("usg").is_between(0.19, 0.21))
+    return Check("player_on_court_totals", "players' on-court possessions = team's x lineup size; usage averages 19-21%",
                  j.height, bad)
