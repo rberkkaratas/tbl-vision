@@ -76,6 +76,7 @@ class Syncer:
         refresh_season: bool = False,
         refresh_players: bool = False,
         with_players: bool = True,
+        player_games: bool = False,
         only: str | None = None,  # "tbf" | "genius"
     ):
         self.s = season
@@ -87,6 +88,7 @@ class Syncer:
         self.refresh_season = refresh_season
         self.refresh_players = refresh_players
         self.with_players = with_players
+        self.player_games = player_games
         self.only = only
         self.stats = RunStats(run_id=uuid.uuid4().hex[:12])
 
@@ -156,6 +158,9 @@ class Syncer:
     def _players(self) -> None:
         for pid in self._box_player_ids():
             for res in sources.player(self.s, pid):
+                # a player's per-season game log repeats our own box scores: only on request
+                if res.kind == "player_season_games" and not self.player_games:
+                    continue
                 self._get(res, Policy(final=True))
 
     def _box_player_ids(self) -> list[int]:

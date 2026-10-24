@@ -40,6 +40,7 @@ def sync(
     only: Annotated[str | None, typer.Option(help="Only fetch from 'tbf' or 'genius'")] = None,
     max_requests: Annotated[int | None, typer.Option(help="Stop after N requests")] = None,
     players: Annotated[bool, typer.Option(help="Fetch player profiles")] = True,
+    player_games: Annotated[bool, typer.Option(help="Also fetch each player's season game log (repeats box scores)")] = False,
     refresh_season: Annotated[bool, typer.Option(help="Refetch fixtures/teams now, ignoring TTL")] = False,
     refresh_players: Annotated[bool, typer.Option(help="Refetch all player profiles")] = False,
     headless: Annotated[bool, typer.Option(help="Run Chrome headless (Cloudflare blocks it more often)")] = False,
@@ -59,7 +60,7 @@ def sync(
     try:
         st = Syncer(s, RawStore(root / "raw"), manifest, tbf, genius, max_requests=max_requests,
                     refresh_season=refresh_season, refresh_players=refresh_players,
-                    with_players=players, only=only).run()
+                    with_players=players, player_games=player_games, only=only).run()
     finally:
         tbf.close()
         genius.close()

@@ -9,7 +9,7 @@ pytestmark = needs_fixtures
 SEASON = 4  # league_weeks, league_info (missing in fixtures), teams, player_list
 WEEKS = 3
 MATCHES = 2 * (1 + 7)  # two played matches x (Genius + 7 TBF endpoints)
-PLAYERS = 22 * 3  # 345960 box score has 22 players with TBF ids
+PLAYERS = 22 * 2  # 345960 box score has 22 players with TBF ids; profile + career (game log is opt-in)
 
 
 def kind_status(m, kind):
