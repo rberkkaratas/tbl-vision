@@ -17,6 +17,13 @@ Left out because the feed only knows them after the outcome:
 Each shot's xPTS comes from a model fitted without its game (5-fold, grouped by match), so
 a player's own shots never shape the expectation they are measured against. Free throws
 (and-ones) are not part of xPTS.
+
+With last season's shots as well, each fold is fitted on last season plus this season's other
+folds ("pooled"): early in a season there are few shots of its own. Two references are scored
+on the same shots: this season alone (in-season folds) and last season's model frozen and
+applied unchanged - an honest out-of-time test of the model. Calibration: observed vs
+predicted FG% in ten bins of predicted FG%, and the slope and intercept of a logistic fit of
+the outcome on logit(xFG): 1 and 0 when the model is neither over- nor under-confident.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ class XptsResult:
     shots: pl.DataFrame  # match_id, action_number, features, xfg, xpts, pts
     coefficients: pl.DataFrame
     metrics: dict
+    calibration: pl.DataFrame  # method x bin: shots, mean xFG, FG%
 
 
 def features(shots: pl.DataFrame, possessions: pl.DataFrame) -> pl.DataFrame:
@@ -78,33 +86,74 @@ def _model():
         LogisticRegression(C=1.0, max_iter=3000))
 
 
-def fit(shots: pl.DataFrame, possessions: pl.DataFrame) -> XptsResult:
+def _scores(y: np.ndarray, p: np.ndarray, value: np.ndarray) -> dict:
+    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+
+    q = np.clip(p, 1e-6, 1 - 1e-6)
+    lr = LogisticRegression(C=np.inf, max_iter=1000).fit(np.log(q / (1 - q))[:, None], y)
+    return {"log_loss": round(log_loss(y, p), 4), "brier": round(brier_score_loss(y, p), 4),
+            "auc": round(roc_auc_score(y, p), 3), "calibration_slope": round(float(lr.coef_[0][0]), 3),
+            "calibration_intercept": round(float(lr.intercept_[0]), 3),
+            "xfg": round(float(p.mean()), 4), "fg": round(float(y.mean()), 4),
+            "xpts_vs_pts": round(float((p * value).sum() / (y * value).sum()), 4)}
+
+
+def _bins(method: str, y: np.ndarray, p: np.ndarray, bins: int = 10) -> pl.DataFrame:
+    edges = np.quantile(p, np.linspace(0, 1, bins + 1))
+    b = np.clip(np.searchsorted(edges, p, side="right") - 1, 0, bins - 1)
+    return pl.DataFrame({"bin": b, "p": p, "y": y}).group_by("bin").agg(
+        shots=pl.len(), xfg=pl.col("p").mean().round(4), fg=pl.col("y").mean().round(4)).sort("bin").with_columns(
+        method=pl.lit(method))
+
+
+def fit(shots: pl.DataFrame, possessions: pl.DataFrame, prior: tuple[pl.DataFrame, pl.DataFrame] | None = None
+        ) -> XptsResult:
+    """prior: last season's (shots_enriched, possessions), if there is one."""
+    from sklearn.metrics import log_loss
     from sklearn.model_selection import GroupKFold
 
     f = features(shots, possessions)
     X, y, groups = _matrix(f), f["made"].cast(pl.Int8).to_numpy(), f["match_id"].to_numpy()
+    if prior is not None:
+        fp = features(*prior)
+        Xp, yp = _matrix(fp), fp["made"].cast(pl.Int8).to_numpy()
     k = min(FOLDS, len(set(groups)))
     zone = f["zone"].to_numpy()
-    p, pz = np.zeros(len(y)), np.zeros(len(y))  # model, and the zone-FG% baseline it must beat
+    p, pz, p_in = np.zeros(len(y)), np.zeros(len(y)), np.zeros(len(y))  # model, zone-FG% baseline, this season only
     if k >= 2:
         for tr, te in GroupKFold(k).split(X, y, groups):
-            p[te] = _model().fit(X[tr], y[tr]).predict_proba(X[te])[:, 1]
+            p_in[te] = _model().fit(X[tr], y[tr]).predict_proba(X[te])[:, 1]
+            if prior is not None:
+                p[te] = _model().fit(np.vstack([Xp, X[tr]]), np.concatenate([yp, y[tr]])).predict_proba(X[te])[:, 1]
             rate = {z: y[tr][zone[tr] == z].mean() for z in set(zone[tr])}
             pz[te] = [rate.get(z, y[tr].mean()) for z in zone[te]]
-    full = _model().fit(X, y)
+        if prior is None:
+            p = p_in
+    full = _model().fit(X, y) if prior is None else _model().fit(np.vstack([Xp, X]), np.concatenate([yp, y]))
     if k < 2:  # too few games to hold any out (tests): in-sample
-        p = full.predict_proba(X)[:, 1]
+        p = p_in = full.predict_proba(X)[:, 1]
         pz = np.array([y[zone == z].mean() for z in zone])
 
     value = f["value"].to_numpy()
     metrics = {
         "shots": len(y), "games": len(set(groups)), "out_of_fold": k >= 2, "folds": k,
-        "log_loss": round(log_loss(y, p), 4), "log_loss_zone_baseline": round(log_loss(y, pz), 4),
+        "prior_shots": 0 if prior is None else len(yp), "method": "in_season" if prior is None else "pooled",
+        **{x: v for x, v in _scores(y, p, value).items() if x in ("log_loss", "brier", "auc")},
+        "log_loss_zone_baseline": round(log_loss(y, pz), 4),
         "log_loss_constant": round(log_loss(y, np.full(len(y), y.mean())), 4),
-        "brier": round(brier_score_loss(y, p), 4), "auc": round(roc_auc_score(y, p), 3),
         "xpts_per_shot": round(float((p * value).mean()), 4), "pts_per_shot": round(float((y * value).mean()), 4),
     }
+    methods = {"in_season": p_in}
+    if prior is not None:
+        methods["prior_frozen"] = _model().fit(Xp, yp).predict_proba(X)[:, 1]
+        methods["pooled"] = p
+    metrics["compare"] = {m: _scores(y, q, value) for m, q in methods.items()}
+    used = "pooled" if prior is not None else "in_season"
+    calibration = pl.concat([_bins(m, y, q).with_columns(
+        used=pl.lit(m == used), log_loss_constant=pl.lit(metrics["log_loss_constant"]),
+        **{x: pl.lit(v) for x, v in metrics["compare"][m].items() if x not in ("xfg", "fg")})  # keep the bins'
+        for m, q in methods.items()])
     names = ["distance (spline)"] + NUMERIC[1:] + [f"family={k}" for k in FAMILIES[1:]]
     coefs = full[-1].coef_[0]
     n_spline = len(coefs) - (len(names) - 1)
@@ -113,4 +162,4 @@ def fit(shots: pl.DataFrame, possessions: pl.DataFrame) -> XptsResult:
         "coef_per_sd": np.round(coefs, 4),  # non-spline terms are standardised: log-odds per 1 SD
     })
     out = f.with_columns(xfg=pl.Series(np.round(p, 4)), xpts=pl.Series(np.round(p * value, 4)))
-    return XptsResult(out, coefficients, metrics)
+    return XptsResult(out, coefficients, metrics, calibration)

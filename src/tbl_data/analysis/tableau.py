@@ -89,6 +89,10 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
         "player_profiles": tables["player_profiles"],
         "player_percentiles": tables["player_percentiles"],
         "clutch_player": tables["clutch_player"].join(names, on="player_id").join(teams, on="team_season_id"),
+        "stat_reliability": tables["stat_reliability"],
+        "xpts_calibration": tables["xpts_calibration"],
+        "prior_backtest": tables["prior_backtest"],
+        "player_stable": tables["player_stable"].join(names, on="player_id").join(teams, on="team_season_id"),
     }
     files = augment(files, team_codes(staged["teams"]))
     for name, df in files.items():

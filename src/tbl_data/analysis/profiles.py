@@ -94,21 +94,29 @@ def player_names(staged: dict[str, pl.DataFrame]) -> pl.DataFrame:
     return pl.concat([tbf, genius.join(tbf, on="player_id", how="anti")])
 
 
-def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame],
-                    shooting: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """-> (one row per player and team, long percentile table for qualified players)."""
+def qualify_minutes(match_teams: pl.DataFrame) -> int:
+    team_games = match_teams.group_by("team_season_id").len()["len"].median()
+    return max(QUALIFY_FLOOR, round(QUALIFY_MPG * team_games / 10) * 10)
+
+
+def player_games(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame],
+                 shots: pl.DataFrame) -> pl.DataFrame:
+    """One row per player and game played: box score, what happened on court while the player
+    was on (from the lineups), the team's game totals and the player's shots with their xPTS.
+    Summed over any set of games it gives the counts every player rate is built from."""
     mp, mt, ev = staged["match_players"], staged["match_teams"], enriched["events_enriched"]
-    box = mp.filter(pl.col("played")).group_by("team_season_id", "player_id").agg(
-        games=pl.len(), starts=pl.col("starter").sum(), seconds=pl.col("seconds").sum(),
-        plus_minus=pl.col("plus_minus").sum(), *[pl.col(c).sum() for c in BOX])
+    keys = ["match_id", "team_season_id", "player_id"]
+    box = mp.filter(pl.col("played")).select(*keys, games=pl.lit(1), starts=pl.col("starter").cast(pl.Int64),
+                                             seconds="seconds", plus_minus="plus_minus", *BOX)
 
     # on court: possessions and points from stints
     st = enriched["stints"]
-    on = st.explode("lineup").rename({"lineup": "player_id"}).group_by("team_season_id", "player_id").agg(
+    on = st.explode("lineup").rename({"lineup": "player_id"}).group_by(keys).agg(
         on_poss_for=pl.col("poss_for").sum(), on_poss_against=pl.col("poss_against").sum(),
         on_pts_for=pl.col("pts_for").sum(), on_pts_against=pl.col("pts_against").sum())
-    team_tot = st.group_by("team_season_id").agg(t_poss_for=pl.col("poss_for").sum(), t_poss_against=pl.col("poss_against").sum(),
-                                                 t_pts_for=pl.col("pts_for").sum(), t_pts_against=pl.col("pts_against").sum())
+    team_tot = st.group_by("match_id", "team_season_id").agg(
+        t_poss_for=pl.col("poss_for").sum(), t_poss_against=pl.col("poss_against").sum(),
+        t_pts_for=pl.col("pts_for").sum(), t_pts_against=pl.col("pts_against").sum())
 
     # on court: team and opponent events (field goals, rebounds, 2PA) from the lineups on each event
     home = mt.filter(pl.col("is_home")).select("match_id", home_id="team_season_id")
@@ -118,13 +126,13 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         | ((pl.col("action_type") == "rebound") & pl.col("sub_type").is_in(["offensive", "defensive"])))
     ).join(home, on="match_id").join(away, on="match_id")
     sides = pl.concat([
-        e.explode("home_lineup").select("action_type", "sub_type", "success", actor="team_season_id",
+        e.explode("home_lineup").select("match_id", "action_type", "sub_type", "success", actor="team_season_id",
                                         player_id="home_lineup", team_season_id="home_id"),
-        e.explode("away_lineup").select("action_type", "sub_type", "success", actor="team_season_id",
+        e.explode("away_lineup").select("match_id", "action_type", "sub_type", "success", actor="team_season_id",
                                         player_id="away_lineup", team_season_id="away_id"),
     ])
     own, a, sub = pl.col("actor") == pl.col("team_season_id"), pl.col("action_type"), pl.col("sub_type")
-    oc = sides.group_by("team_season_id", "player_id").agg(
+    oc = sides.group_by(keys).agg(
         on_team_fgm=(own & a.is_in(["2pt", "3pt"]) & pl.col("success")).sum(),
         on_team_plays=(own & a.is_in(["2pt", "3pt"])).sum() + 0.44 * (own & (a == "freethrow")).sum()
         + (own & (a == "turnover")).sum(),
@@ -133,18 +141,33 @@ def player_profiles(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.Data
         on_opp_oreb=(~own & (a == "rebound") & (sub == "offensive")).sum(),
         on_opp_dreb=(~own & (a == "rebound") & (sub == "defensive")).sum(),
         on_opp_fg2a=(~own & (a == "2pt")).sum())
+    sh = shots.group_by(keys).agg(shots=pl.len(), shot_pts=pl.col("pts").sum(), xpts=pl.col("xpts").sum(),
+                                  xvar=(pl.col("xfg") * (1 - pl.col("xfg")) * pl.col("value") ** 2).sum())
+    return (box.join(on, on=keys, how="left").join(oc, on=keys, how="left")
+            .join(team_tot, on=["match_id", "team_season_id"], how="left").join(sh, on=keys, how="left")
+            .with_columns(pl.col("shots").fill_null(0), pl.col("shot_pts", "xpts", "xvar").fill_null(0)))
 
+
+def player_profiles(staged: dict[str, pl.DataFrame], games: pl.DataFrame,
+                    shooting: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """-> (one row per player and team, long percentile table for qualified players)."""
+    mt = staged["match_teams"]
+    on_cols = ["on_poss_for", "on_poss_against", "on_pts_for", "on_pts_against", "on_team_fgm", "on_team_plays",
+               "on_team_oreb", "on_team_dreb", "on_opp_oreb", "on_opp_dreb", "on_opp_fg2a"]
+    totals = games.group_by("team_season_id", "player_id").agg(
+        pl.col(*BOX, "games", "starts", "seconds", "plus_minus", *on_cols).sum())
+    # off court: everything the team did in the season (all its games) without the player
+    team_tot = games.unique(["match_id", "team_season_id"]).group_by("team_season_id").agg(
+        pl.col("t_poss_for", "t_poss_against", "t_pts_for", "t_pts_against").sum())
     names = player_names(staged)
     season_start = staged["matches"]["start_utc"].min().date()  # ages at the season's first game
     info = staged["players"].select("player_id", "nationality", "birth_date").unique("player_id").with_columns(
         age=((pl.lit(season_start) - pl.col("birth_date")).dt.total_days() / 365.25).round(1))
-    team_games = mt.group_by("team_season_id").len()["len"].median()
-    qualify_min = max(QUALIFY_FLOOR, round(QUALIFY_MPG * team_games / 10) * 10)
+    qualify_min = qualify_minutes(mt)
     teams = staged["teams"].select("team_season_id", team="name")
     shoot = shooting.select("team_season_id", "player_id", xpts_per_shot="xpts_per_shot", poe_per_shot="poe_per_shot",
                             poe_se="poe_se")
-    d = (box.join(on, on=["team_season_id", "player_id"], how="left").join(oc, on=["team_season_id", "player_id"], how="left")
-         .join(team_tot, on="team_season_id").join(shoot, on=["team_season_id", "player_id"], how="left")
+    d = (totals.join(team_tot, on="team_season_id").join(shoot, on=["team_season_id", "player_id"], how="left")
          .join(names, on="player_id").join(teams, on="team_season_id").join(info.drop("birth_date"), on="player_id", how="left"))
     m = pl.col("seconds") / 60
     d = d.with_columns(

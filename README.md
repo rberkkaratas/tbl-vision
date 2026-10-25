@@ -157,9 +157,10 @@ Rules (measured on 2026-27):
 
 `uv run tbl analyze` reads the staged and enriched Parquet and writes
 `~/data/tbl/analysis/league=tbl/season=2026-27/*.parquet` (same DuckDB file), `metrics.json`,
-and flat CSVs, a FIBA half-court image and a ready workbook (`tbl-2026-27.twb`: 6 interactive
+and flat CSVs, a FIBA half-court image and a ready workbook (`tbl-2026-27.twb`: 7 interactive
 dashboards driven by Takım/Oyuncu/Maç parameters, on Hyper extracts) for Tableau Public in `~/data/tbl/tableau/tbl-2026-27/`
-(see [docs/tableau.md](docs/tableau.md)).
+(see [docs/tableau.md](docs/tableau.md)). If the season before has been analysed, it is used
+too (xPTS training shots, stabilization points, player priors): analyse seasons in order.
 
 | Table | Grain | What it holds |
 |---|---|---|
@@ -176,6 +177,11 @@ dashboards driven by Takım/Oyuncu/Maç parameters, on Hyper extracts) for Table
 | `game_flow` | team-game | biggest lead and run, lead changes, ties, time leading, largest deficit |
 | `runs` | run of 8+ points | team, points, start/end time, margin before and after |
 | `clutch_possessions`, `clutch_team`, `clutch_player` | possession / team / player | last 5 min of Q4/OT within 5 points |
+| `xpts_calibration` | model x bin | predicted vs observed FG% in ten bins, with log loss, Brier, calibration slope and intercept per model |
+| `player_games` | player x game | box score, on-court counts, team totals and shot xPTS: every player rate sums from these |
+| `stat_reliability` | rate | sampling noise `sigma`, true spread `tau`, stabilization point `k` (90% bootstrap interval), `k` in games, split-half check |
+| `prior_backtest`, `prior_weights` | rate x games / rate group | first 2/4/8 games -> rest of season: RMSE raw, padded, with last season; tuned weights `d` |
+| `player_stable` | player x team x rate | raw rate and units, last season's rate and source, padded estimate with a 90% interval, weights |
 
 - **xPTS**: logistic regression on distance (spline), angle, 2/3, end of period, shot family,
   second chance, transition, off a turnover, seconds into the possession and margin; no
@@ -192,6 +198,21 @@ dashboards driven by Takım/Oyuncu/Maç parameters, on Hyper extracts) for Table
   20%; AST% = assists / teammates' field goals on court; rebound, steal and block rates use
   on-court opportunities; on/off = team net rating on minus off. Team ratings use counted
   possessions and box points (technical FTs included).
+- **Last season in xPTS**: with the season before analysed, each fold is fitted on last
+  season's shots plus this season's other folds. Last season's model, frozen, is also scored
+  on this season: on 2026-27 (7,131 shots) log loss 0.645 vs 0.647 in-season, calibration
+  slope 1.02 and intercept +0.01, so the model does not drift between seasons.
+- **Stabilization** (`stability.py`): for each rate, odd vs even games give the sampling
+  noise and the season's spread gives the true spread (method of moments); `k = sigma^2 /
+  tau^2` units make a rate half skill. On 2025-26: FT% 17 attempts, 3P% 270, USG% 56 team
+  plays, STL% 520 opponent possessions, POE 290 shots, on/off ~710 possessions (the
+  split-half check says on/off is noisier still) - close to NBA estimates.
+- **Padded rates**: `(n p + d n_prev p_prev + k mu) / (n + d n_prev + k)`, last season from our
+  own play-by-play or TBF's career totals (box score; other leagues at their own weight).
+  `d` is tuned per group by predicting the rest of 2025-26 from its first games with
+  2024-25 totals: shooting d = 1.0 (0.7-1.0), role 0.45, per-minute production 0.3; capped at
+  1. After 4 games padding cuts the error of the raw rate by 7-62% (most rates 30-60%), last season by a
+  further 0.5-22% for players who have one, and 90% intervals cover 89% of outcomes.
 - **Small samples**: 6-7 games per team. Pair ratings and clutch numbers come with their
   possession counts and `poe_se` gives the noise in points over expected; filter on
   them (e.g. pairs with 100+ possessions) rather than reading single numbers.

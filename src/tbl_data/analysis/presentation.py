@@ -12,6 +12,8 @@ import math
 
 import polars as pl
 
+from .stability import ON_OFF, STATS, UNIT
+
 
 def num(v, d: int = 1, sign: bool = False) -> str | None:
     if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -69,6 +71,7 @@ def augment(files: dict[str, pl.DataFrame], codes: dict[str, str]) -> dict[str, 
     per_club = f["player_profiles"].group_by("player").agg(pl.col("team").n_unique())
     moved = per_club.filter(pl.col("team") > 1)["player"]
     for k, cols in {"player_profiles": ["player"], "player_percentiles": ["player"], "player_shooting": ["player"],
+                    "player_stable": ["player"],
                     "player_zone_shooting": ["player"], "clutch_player": ["player"], "shots": ["player", "assist_player"],
                     "pairs": ["player_a", "player_b"], "assist_pairs": ["passer", "scorer"]}.items():
         f[k] = f[k].with_columns(pl.when(pl.col(c).is_in(moved)).then(pl.format("{} ({})", pl.col(c), code("team")))
@@ -218,4 +221,87 @@ def augment(files: dict[str, pl.DataFrame], codes: dict[str, str]) -> dict[str, 
     f["clutch_team"] = f["clutch_team"].with_columns(
         label=pl.struct("net", "poss").map_elements(lambda s: f"{num(s['net'], 1, True)} ({s['poss']} hücum)",
                                                      return_dtype=pl.String))
+    f.update(reliability_views(f["stat_reliability"], f["xpts_calibration"], f["prior_backtest"], f["player_stable"]))
     return f
+
+
+# how each rate reads: format, order on the player table
+RATE_FMT = {"xpts_per_shot": lambda v: num(v, 2), "poe_per_shot": lambda v: num(v, 2, True),
+            ON_OFF: lambda v: num(v, 1, True)}
+RATE_ORDER = ["ts", "efg", "fg2_pct", "fg3_pct", "ft_pct", "xpts_per_shot", "poe_per_shot", "fg3a_rate", "ft_rate",
+              "usg", "ast_pct", "tov_pct", "orb_pct", "drb_pct", "stl_pct", "blk_pct", ON_OFF]
+LABEL = {**{s.name: s.label for s in STATS}, ON_OFF: "On/off net"}
+STABLE_COLS = ["Bu sezon", "Deneme", "Geçen sezon", "Dengeli", "%90 aralık"]
+CAL_METHODS = {"in_season": "Yalnız bu sezon (5 katlı)", "prior_frozen": "Geçen sezonun modeli (dondurulmuş)",
+               "pooled": "Geçen + bu sezon"}
+
+
+def _rate(stat: str, v) -> str | None:
+    return None if v is None or (isinstance(v, float) and math.isnan(v)) else RATE_FMT.get(stat, pct)(v)
+
+
+def reliability_views(rel: pl.DataFrame, cal: pl.DataFrame, backtest: pl.DataFrame,
+                      stable: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    """Long, pre-formatted tables for the Güven dashboard."""
+    shown = [x for x in RATE_ORDER if x in set(rel["stat"])]
+    order = {x: i for i, x in enumerate(RATE_ORDER, 1)}
+    finite = lambda c: pl.when(pl.col(c).is_finite()).then(pl.col(c))  # noqa: E731
+    r = rel.filter(pl.col("stat").is_in(shown)).with_columns(
+        label=pl.col("stat").replace_strict(LABEL), metric_order=pl.col("stat").replace_strict(order, return_dtype=pl.Int32),
+        k=finite("k"), k_lo=finite("k_lo"), k_hi=finite("k_hi"), k_games=finite("k_games"))
+    r = r.with_columns(
+        k_games_lo=pl.col("k_lo") / pl.col("units_per_game"), k_games_hi=pl.col("k_hi") / pl.col("units_per_game"),
+        settles=pl.when(pl.col("k_games") <= pl.col("season_games") / 4).then(pl.lit("Çeyrek sezonda"))
+        .when(pl.col("k_games") <= pl.col("season_games")).then(pl.lit("Bir sezon içinde"))
+        .otherwise(pl.lit("Bir sezon yetmez")))
+    r = r.with_columns(
+        k_text=pl.struct("k", "k_games", "unit").map_elements(
+            lambda x: None if x["k"] is None else f"{num(x['k_games'], 1)} maç · {num(x['k'], 0)} {x['unit']}",
+            return_dtype=pl.String),
+        # an upper bound beyond a few seasons only says "very slow"
+        interval_text=pl.struct("k_games_lo", "k_games_hi", "season_games").map_elements(
+            lambda x: f"≥ {num(x['k_games_lo'], 1)} maç" if x["k_games_hi"] is None
+            or x["k_games_hi"] > 3 * x["season_games"] else f"{num(x['k_games_lo'], 1)} – {num(x['k_games_hi'], 1)} maç",
+            return_dtype=pl.String),
+        season_text=_fmt("season_reliability", lambda v: pct(v, 0)))
+
+    # observed minus predicted FG% per bin of predicted FG%, in points: a calibrated model hugs 0
+    c = cal.with_columns(method_label=pl.when(pl.col("used") & (pl.col("method") == "in_season"))
+                         .then(pl.lit("Kullanılan: yalnız bu sezon (5 katlı)"))
+                         .otherwise(pl.col("method").replace_strict(CAL_METHODS)),
+                         gap=((pl.col("fg") - pl.col("xfg")) * 100).round(2))
+
+    if backtest.height:
+        b = backtest.filter((pl.col("games") == 4) & pl.col("stat").is_in(shown))
+        b = pl.concat([b.select("stat", "with_prior", method=pl.lit(m), method_order=pl.lit(i),
+                                value=(100 * pl.col(col) / pl.col("rmse_raw_with_prior")).round(1))
+                       for i, (m, col) in enumerate([("Ham değer", "rmse_raw_with_prior"),
+                                                     ("Lig ortalamasıyla", "rmse_padded_with_prior"),
+                                                     ("+ geçen sezon", "rmse_prior_with_prior")], 1)])
+        b = b.with_columns(label=pl.col("stat").replace_strict(LABEL),
+                           metric_order=pl.col("stat").replace_strict(order, return_dtype=pl.Int32),
+                           value_text=_fmt("value", lambda v: num(v, 0)))
+    else:
+        b = pl.DataFrame(schema={"stat": pl.String, "with_prior": pl.Int64, "method": pl.String, "method_order": pl.Int32,
+                                 "value": pl.Float64, "label": pl.String, "metric_order": pl.Int32, "value_text": pl.String})
+
+    rows = []
+    for x in stable.filter(pl.col("stat").is_in(shown)).iter_rows(named=True):
+        st = x["stat"]
+        prev = "–" if x["prior"] is None else (
+            f"{_rate(st, x['prior'])}" + ("" if x["prior_source"] == "TBL" else " *"))
+        vals = [_rate(st, x["raw"]) or "–", num(x["units"], 0), prev, _rate(st, x["estimate"]),
+                f"{_rate(st, x['lo'])}–{_rate(st, x['hi']).lstrip('%')}"]
+        tip_units = f"{num(x['units'], 0)} {UNIT[st]}" + (
+            f" · geçen sezon {num(x['prior_units'], 0)} ({x['prior_source']})" if x["prior"] is not None else "")
+        weights = (f"bu sezon {pct(x['w_season'], 0)} · geçen sezon {pct(x['w_prior'], 0)} · "
+                   f"lig ortalaması {pct(x['w_league'], 0)}")
+        for i, (col, v) in enumerate(zip(STABLE_COLS, vals), 1):
+            rows.append({"player": x["player"], "team": x["team"], "stat": st, "label": LABEL[st],
+                         "metric_order": order[st], "col": col, "col_order": i, "value_text": v,
+                         "units_text": tip_units, "weights_text": weights})
+    ps = pl.DataFrame(rows) if rows else pl.DataFrame(schema={
+        "player": pl.String, "team": pl.String, "stat": pl.String, "label": pl.String, "metric_order": pl.Int64,
+        "col": pl.String, "col_order": pl.Int64, "value_text": pl.String, "units_text": pl.String,
+        "weights_text": pl.String})
+    return {"stat_reliability": r, "xpts_calibration": c, "prior_backtest": b, "player_stable": ps}

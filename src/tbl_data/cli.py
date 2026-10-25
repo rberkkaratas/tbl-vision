@@ -9,7 +9,7 @@ from typing import Annotated
 import structlog
 import typer
 
-from .config import data_dir, get_season
+from .config import data_dir, get_season, previous_season
 from .fetch.browser import BrowserFetcher
 from .fetch.files import FileFetcher
 from .fetch.http import HttpxFetcher
@@ -135,6 +135,7 @@ def analyze(
 
     from . import build as B
     from . import validate as V
+    from .analysis import Prior
     from .analysis import analyze as run_analysis
     from .analysis.tableau import export
 
@@ -142,7 +143,17 @@ def analyze(
     s = get_season(league, season)
     root = data or data_dir()
     staged, enriched = B.read_layer(root, "staged", s), B.read_layer(root, "enriched", s)
-    a = run_analysis(staged, enriched)
+    prior = None
+    if (ps := previous_season(s)) is not None:
+        try:
+            prior = Prior(ps.key, B.read_layer(root, "enriched", ps), B.read_layer(root, "analysis", ps))
+        except FileNotFoundError:
+            typer.echo(f"no analysed {ps.key} season: xPTS and player rates use this season only")
+        else:
+            if "player_games" not in prior.analysis:
+                typer.echo(f"{ps.key} analysis predates player_games: run `tbl analyze --season {ps.key}` first")
+                raise typer.Exit(1)
+    a = run_analysis(staged, enriched, prior, s.key)
     out = B.write_layer(root, "analysis", s, a.tables)
     (out / "metrics.json").write_text(json.dumps(a.metrics, indent=2))
     typer.echo(f"\nanalysis -> {out}")

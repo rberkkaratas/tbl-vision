@@ -9,7 +9,7 @@ CSV dosyaları ve `court.png` (FIBA yarı saha, 15 m × 14 m, dip çizgi altta).
 
 ## Hazır workbook
 `tbl-2026-27.twb` aynı klasörde. Kodla üretiliyor (`src/tbl_data/analysis/dashboards.py` tasarım,
-`workbook.py` XML) ve her `tbl analyze` çalıştırmasında yenileniyor. İçinde 6 dashboard var:
+`workbook.py` XML) ve her `tbl analyze` çalıştırmasında yenileniyor. İçinde 7 dashboard var:
 
 | Dashboard | Ne gösteriyor | Tıklayınca |
 |---|---|---|
@@ -18,13 +18,16 @@ CSV dosyaları ve `court.png` (FIBA yarı saha, 15 m × 14 m, dip çizgi altta).
 | Oyuncular | oyuncu kartı, ligdeki yüzdelik profili, kullanım × TS%, on/off | oyuncu seçilir |
 | İkililer | ikililer birlikte / biri kenardayken, asist ağı | pası veren oyuncu seçilir |
 | Maçlar | skor farkı (basamaklı çizgi), maç özeti, seriler, geri dönüşler, clutch | maç ya da takım seçilir |
+| Güven | seçili takımın kadrosu, seçili oyuncunun ham ve dengeli değerleri (%90 aralık), her istatistiğin kaç maçta oturduğu, xPTS kalibrasyonu, geçen sezonun tahmine katkısı (sayfa 1100 px, alttaki iki grafik kaydırınca) | kadro → oyuncu ve takımı |
 | Yöntem | veri, sözlük, küçük örneklem uyarısı | — |
 
 **Etkileşim:** Takım, Oyuncu ve Maç birer parametredir; üstteki listelerden ya da grafiklere
 tıklayarak seçilir ve bütün dashboard'lara geçer (seçili olan turuncu, diğerleri gri). Seçili
 işarete tekrar tıklamak seçimi kaldırır; listeden "Tümü" seçmek de sıfırlar. Hiçbir şey seçili
 değilken oyuncu/ikili sayfaları örnek olarak en iyi net reytingli takımı ve onun en çok süre alan
-oyuncusunu gösterir. Üstteki butonlar dashboard'lar arasında gezdirir.
+oyuncusunu gösterir. Oyuncu listesi takıma göre gruplu ("Ormanspor · Diante Watkins", takım içinde
+en çok süre alan önce): Tableau Public parametre listesini başka bir parametreye göre süzemediği için
+Güven sayfasında seçili takımın tıklanabilir kadrosu da var. Üstteki butonlar dashboard'lar arasında gezdirir.
 
 **Yayınlama:** dosyayı Tableau Public'te açın ve **File → Save to Tableau Public As…** ile kaydedin
 (veri kaynakları Hyper extract olduğu için ek adım gerekmez). Yayından sonra workbook sayfasında
@@ -57,6 +60,10 @@ Aşağıdaki adımlar aynı görünümleri elle kurmak ya da değiştirmek için
 | `player_percentiles.csv` | oyuncu × metrik | 100+ dakika oynayanlar arasında yüzdelik |
 | `game_flow.csv`, `runs.csv` | takım-maç / seri | geri dönüşler, seriler |
 | `clutch_team.csv`, `clutch_player.csv` | takım / oyuncu | son 5 dakika, fark ≤ 5 |
+| `player_stable.csv` | oyuncu × istatistik × sütun | ham, deneme, geçen sezon, dengeli, %90 aralık (metin) |
+| `stat_reliability.csv` | istatistik | kaç denemede / kaç maçta oturur, aralığı |
+| `xpts_calibration.csv` | model × kutu | beklenen ve gerçek isabet, fark (puan) |
+| `prior_backtest.csv` | istatistik × yöntem | ilk 4 maçtan sezonun kalanını tahmin hatası (ham = 100) |
 
 Alan sözlüğü:
 - `xfg`: atışın isabet olasılığı. `xpts` = `xfg` × 2 veya 3.

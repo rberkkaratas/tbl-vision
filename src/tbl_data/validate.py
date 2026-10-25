@@ -426,7 +426,8 @@ def shot_zones(e) -> Check:
 def run_analysis(s: dict[str, pl.DataFrame], e: dict[str, pl.DataFrame], a: dict[str, pl.DataFrame],
                  metrics: dict) -> list[Check]:
     return [game_flow_vs_genius(s, a), score_timeline_final(s, a), xpts_calibration(a, metrics),
-            pairs_consistency(a), assist_pairs_total(e, a), team_profile_totals(s, a), player_on_court_totals(e, a)]
+            pairs_consistency(a), assist_pairs_total(e, a), team_profile_totals(s, a), player_on_court_totals(e, a),
+            calibration_bins(a), xpts_out_of_time(metrics), stat_reliability(a), split_half(a), prior_backtest(a), player_stable(a)]
 
 
 def game_flow_vs_genius(s, a) -> Check:
@@ -505,3 +506,75 @@ def player_on_court_totals(e, a) -> Check:
     bad = j.filter((pl.col("on") != pl.col("n")) | ~pl.col("usg").is_between(0.19, 0.21))
     return Check("player_on_court_totals", "players' on-court possessions = team's x lineup size; usage averages 19-21%",
                  j.height, bad)
+
+
+def calibration_bins(a) -> Check:
+    """Ten bins of predicted FG% per model, each with its own predicted and observed FG%, rising."""
+    c = a["xpts_calibration"].sort("method", "bin")
+    bad = c.with_columns(step=pl.col("xfg").diff().over("method")).filter(
+        (pl.col("step") <= 0) | ~pl.col("fg").is_between(0, 1)).select("method", "bin", "xfg", "fg")
+    return Check("calibration_bins", "calibration bins: predicted FG% rises bin to bin; observed within 0-1", c.height, bad)
+
+
+def xpts_out_of_time(metrics) -> Check:
+    """Last season's xPTS model, frozen, on this season's shots: calibration slope 0.85-1.15,
+    intercept within 0.1, better than a constant FG%."""
+    m = metrics["xpts"]
+    cmp = m.get("compare", {}).get("prior_frozen")
+    if cmp is None:
+        return Check("xpts_out_of_time", "no prior season: nothing to test out of time", 0, pl.DataFrame(), blocking=False)
+    row = pl.DataFrame([{**cmp, "log_loss_constant": m["log_loss_constant"]}])
+    bad = row.filter(~pl.col("calibration_slope").is_between(0.85, 1.15) | (pl.col("calibration_intercept").abs() > 0.1)
+                     | (pl.col("log_loss") >= pl.col("log_loss_constant")))
+    return Check("xpts_out_of_time", f"last season's model on this season: slope {cmp['calibration_slope']}, "
+                 f"intercept {cmp['calibration_intercept']}, log loss {cmp['log_loss']}", 1, bad, blocking=False)
+
+
+def stat_reliability(a) -> Check:
+    """Every rate has positive sampling noise and true spread (a finite stabilization point)."""
+    r = a["stat_reliability"]
+    if r.height and r["players"].max() < 30:
+        return Check("stat_reliability", "too few players to fit stabilization points", r.height, pl.DataFrame(),
+                     blocking=False)
+    bad = r.filter(~((pl.col("sigma") > 0) & (pl.col("tau") > 0) & pl.col("k").is_finite() & (pl.col("k") > 0)))
+    return Check("stat_reliability", f"finite stabilization point k for every rate (fitted on {r['fitted_on'][0]})",
+                 r.height, bad.select("stat", "sigma", "tau", "k"))
+
+
+def split_half(a) -> Check:
+    """Model check: the odd/even-game correlation the fitted noise and spread imply = the observed
+    one, within two standard errors of a correlation over that many players (at least 0.1)."""
+    r = a["stat_reliability"]
+    tol = pl.max_horizontal(pl.lit(0.1), 2 * (1 - pl.col("split_r_model") ** 2) / (pl.col("split_players") - 1).sqrt())
+    bad = r.filter((pl.col("split_r") - pl.col("split_r_model")).abs() > tol)
+    return Check("split_half", "observed odd/even-game correlation = implied by sigma, tau (2 SE)", r.height,
+                 bad.select("stat", "split_players", "split_r", "split_r_model"), blocking=False)
+
+
+def prior_backtest(a) -> Check:
+    """Predicting the rest of the season from its first 4 games: padding beats the raw rate,
+    last season helps (or does no harm), and 90% intervals cover 80-97% of what happened."""
+    b = a["prior_backtest"]
+    if b.height == 0:
+        return Check("prior_backtest", "no backtest (no career data)", 0, pl.DataFrame(), blocking=False)
+    b4 = b.filter(pl.col("games") == 4)
+    bad = b4.filter((pl.col("rmse_padded") >= pl.col("rmse_raw")) | (pl.col("rmse_prior") > pl.col("rmse_padded"))
+                    | ~pl.col("coverage_90").is_between(0.8, 0.97))
+    return Check("prior_backtest", f"first 4 games -> rest of season: padded < raw, with last season <= padded, "
+                 f"90% intervals cover 80-97% (fitted on {b['fitted_on'][0]})", b4.height,
+                 bad.select("stat", "rmse_raw", "rmse_padded", "rmse_prior", "coverage_90"), blocking=False)
+
+
+def player_stable(a) -> Check:
+    """A padded rate lies between its sources (this season, last season, league); the weights sum to 1."""
+    t = a["player_stable"]
+    if t.height == 0:
+        return Check("player_stable", "no padded rates (too few games for any stabilization point)", 0, pl.DataFrame(),
+                     blocking=False)
+    lo = pl.min_horizontal(pl.col("raw").fill_null(pl.col("league_rate")), pl.col("prior").fill_null(pl.col("league_rate")), "league_rate")
+    hi = pl.max_horizontal(pl.col("raw").fill_null(pl.col("league_rate")), pl.col("prior").fill_null(pl.col("league_rate")), "league_rate")
+    bad = t.filter(~pl.col("estimate").is_between(lo - 1e-9, hi + 1e-9)
+                   | ((pl.col("w_season") + pl.col("w_prior") + pl.col("w_league") - 1).abs() > 1e-9)
+                   | ~((pl.col("lo") <= pl.col("estimate")) & (pl.col("estimate") <= pl.col("hi"))))
+    return Check("player_stable", "padded rates between this season, last season and league; weights sum to 1",
+                 t.height, bad.select("player_id", "stat", "raw", "prior", "league_rate", "estimate"))

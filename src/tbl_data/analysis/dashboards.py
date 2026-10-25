@@ -14,6 +14,7 @@ from pathlib import Path
 
 import polars as pl
 
+from .presentation import num
 from .workbook import Axis, Calc, Dashboard, F, Param, ParamAction, RefLine, Sheet, Source, Workbook, Zone
 
 INK, SEC, RULE = "#1b2430", "#5b6673", "#e3e6ea"
@@ -21,7 +22,7 @@ ACCENT, ACCENT_LIGHT, GREY, LOW = "#e8590c", "#f6b48a", "#b4bcc5", "#e1e5ea"
 GOOD, GOOD_L, MID, BAD_L, BAD = "#2166ac", "#92c5de", "#dcdcdc", "#f4a582", "#b2182b"
 ALL = "Tümü"
 TOP_COMEBACKS = 8  # rows that fit the comeback chart at a readable size
-NAV = ["Takımlar", "Şut Kalitesi", "Oyuncular", "İkililer", "Maçlar", "Yöntem"]
+NAV = ["Takımlar", "Şut Kalitesi", "Oyuncular", "İkililer", "Maçlar", "Güven", "Yöntem"]
 
 T_TITLE = {"fontname": "Tableau Semibold", "fontsize": "20", "fontcolor": INK}
 T_SUB = {"fontname": "Tableau Book", "fontsize": "10", "fontcolor": SEC}
@@ -45,6 +46,7 @@ FMT_P0 = "p0%"
 FMT_P1 = "p0.0%"
 
 TEAM_COLORS = {ALL: SEC, "Seçili takım": ACCENT, "Diğer": GREY}
+GUVEN_H = 1100  # taller than the rest: roster, table and reliability on top, the method checks below
 PLAYER_COLORS = {"Seçili oyuncu": ACCENT, "Seçili takım": ACCENT_LIGHT, ALL: SEC, "Diğer": GREY}
 
 
@@ -100,16 +102,16 @@ def player_block(top_player_case: str) -> list[Calc]:
     ]
 
 
-def frame(heading: str, subtitle: str, note: str | None, footer: str) -> list[Zone]:
+def frame(heading: str, subtitle: str, note: str | None, footer: str, height: int = 800) -> list[Zone]:
     zones = [Zone("blank", 0, 0, 1200, 4, background=ACCENT),
-             Zone("text", 16, 10, 560, 32, runs=[(heading, T_TITLE)]),
+             Zone("text", 16, 10, 490, 32, runs=[(heading, T_TITLE)]),
              Zone("text", 16, 42, 900, 20, runs=[(subtitle, T_SUB)]),
              Zone("blank", 16, 66, 1168, 1, background=RULE),
-             Zone("text", 16, 778, 1168, 18, runs=[(footer, T_FOOT)])]
+             Zone("text", 16, height - 22, 1168, 18, runs=[(footer, T_FOOT)])]
     if note:
         zones.append(Zone("text", 16, 116, 1168, 30, runs=[("Nasıl okunur · ", T_NOTE_B), (note, T_NOTE)]))
     for i, target in enumerate(NAV):
-        zones.append(Zone("nav", 1184 - (len(NAV) - i) * 104, 16, 100, 28, target=target, title=target))
+        zones.append(Zone("nav", 1184 - (len(NAV) - i) * 96, 16, 92, 28, target=target, title=target))
     return zones
 
 
@@ -146,6 +148,15 @@ def design(directory: Path) -> Workbook:
     forfeits = [f"{nick[t]} ({n})" for t, n in lost.iter_rows()]  # team (games it lost 0-20 at the table)
     rating_se = round(110 / (tp.filter(~pl.col("is_league"))["poss"].mean() ** 0.5))  # 1 SE of a team rating
     qmin = int(pp["qualify_min"][0])
+    rel = pl.read_csv(d / "stat_reliability.csv")
+    rel_from = rel["fitted_on"][0] if rel.height else season
+    season_games = int(round(rel["season_games"][0])) if rel.height else g_hi
+    cal = pl.read_csv(d / "xpts_calibration.csv").filter(pl.col("method") != "ideal")
+    cal_used = cal.filter(pl.col("used")).row(0, named=True)
+    frozen = cal.filter(pl.col("method") == "prior_frozen")
+    frozen = frozen.row(0, named=True) if frozen.height else None
+    bt = pl.read_csv(d / "prior_backtest.csv")
+    bt_n = int(bt["with_prior"].max()) if bt.height else 0
     footer = (f"Veri: TBF ve FIBA LiveStats kamuya açık maç verisi · {n_games} maç, {weeks[0]}–{weeks[1]}. hafta · "
               f"TBL {season} {span} · tbl-vision")
 
@@ -159,16 +170,33 @@ def design(directory: Path) -> Workbook:
     shown_team = (f'IF {{Oyuncu}} <> "{ALL}" AND NOT ISNULL([Calculation_oyuncunun_takimi]) '
                   f'THEN [Calculation_oyuncunun_takimi] ELSEIF {{Takım}} <> "{ALL}" THEN {{Takım}} '
                   f'ELSE "{showcase_team}" END')
+    # Güven: the roster of the chosen team (else of the chosen player, else the showcase team); the table shows the
+    # chosen player if they play for it, else its top player, so picking another team never leaves a stale player
+    roster_team = (f'IF {{Takım}} <> "{ALL}" THEN {{Takım}} ELSEIF {{Oyuncu}} <> "{ALL}" AND NOT '
+                   f'ISNULL([Calculation_oyuncunun_takimi]) THEN [Calculation_oyuncunun_takimi] ELSE "{showcase_team}" END')
+    roster_player = (f'IF {{Oyuncu}} <> "{ALL}" AND [Calculation_oyuncunun_takimi] = [Calculation_kadro_takim] '
+                     'THEN {Oyuncu} ELSE CASE [Calculation_kadro_takim] '
+                     + " ".join(f'WHEN "{t}" THEN "{p}"' for t, p in top_of.items()) + " END END")
+
+    def roster_block() -> list[Calc]:
+        return [
+            Calc("oyuncunun_takimi", "Oyuncunun Takımı", '{FIXED : MAX(IF [player] = {Oyuncu} THEN [team] END)}',
+                 "string"),
+            Calc("kadro_takim", "Kadro Takımı", roster_team, "string"),
+            Calc("kadro_oyuncu", "Kadro Oyuncusu", roster_player, "string"),
+        ]
+
     comeback = gf.filter(pl.col("won")).sort("largest_deficit", descending=True).row(0, named=True)
     matches = gf.filter(pl.col("is_home")).sort("date", "match_id")
     match_members = [(int(r["match_id"]), f"{r['week']}. hf · {r['team_short']} {r['pts']}–{r['opp_pts']} {r['opponent_short']}")
                      for r in matches.iter_rows(named=True)]
 
     p_team = Param("Takım", "string", ALL, members=[(ALL, None)] + [(t, nick[t]) for t in teams])
-    players = pp.sort("player")
+    # grouped by team, most minutes first: a team's roster sits together in the list
+    players = pp.with_columns(order=pl.col("team").replace_strict({t: i for i, t in enumerate(teams)}, default=len(teams)))
     p_player = Param("Oyuncu", "string", ALL, members=[(ALL, None)] + [
-        (r["player"], r["player"] if r["player"].endswith(")") else f"{r['player']} ({r['team_short']})")
-        for r in players.iter_rows(named=True)])  # a mid-season transfer's name already carries the club
+        (r["player"], f"{r['team_short']} · {r['player'].split(' (')[0]}")  # a mid-season transfer's name carries the club
+        for r in players.sort("order", "minutes", descending=[False, True]).iter_rows(named=True)])
     p_side = Param("Taraf", "string", "Hücum", members=[("Hücum", None), ("Savunma", None)])
     p_ctx = Param("Şut Bağlamı", "string", ALL, members=[(v, None) for v in
                                                         (ALL, "Hızlı hücum", "Set hücum", "İkinci şans",
@@ -356,9 +384,16 @@ def design(directory: Path) -> Workbook:
                                          'THEN "Sahadayken daha iyi" ELSE "Sahadayken daha kötü" END', "string"),
         Calc("onoff_satir", "Oyuncu", 'IF [player] = {Oyuncu} THEN "▶ " + [Calculation_kisa_ad] '
                                       'ELSE [Calculation_kisa_ad] END', "string"),
+        *roster_block()[1:],
+        Calc("kadro_filtre", "Kadro Filtresi", "[team] = [Calculation_kadro_takim] AND [minutes] > 0", "boolean"),
+        Calc("kadro_satir", "Kadro", 'IF [player] = [Calculation_kadro_oyuncu] THEN "▶ " + [Calculation_kisa_ad] '
+                                     'ELSE [Calculation_kisa_ad] END', "string"),
+        Calc("kadro_renk", "Kadro Renk", 'IF [player] = [Calculation_kadro_oyuncu] THEN "Seçili oyuncu" '
+                                         'ELSE "Seçili takım" END', "string"),
+        Calc("kadro_kisa", "Kadro Takımı (kısa)", short_case.replace("gosterilen_takim", "kadro_takim"), "string"),
     ], captions={"usg": "Kullanım (USG%)", "ts": "TS%", "on_off": "On/off farkı", "minutes": "Dakika",
                  "player": "Oyuncu", "team": "Takım"},
-        colors={"[none:Calculation_oyuncu_vurgu:nk]": PLAYER_COLORS,
+        colors={"[none:Calculation_oyuncu_vurgu:nk]": PLAYER_COLORS, "[none:Calculation_kadro_renk:nk]": PLAYER_COLORS,
                 "[none:Calculation_onoff_renk:nk]": {"Az veri": LOW, "Sahadayken daha iyi": GOOD,
                                                      "Sahadayken daha kötü": BAD}})
     pct = Source("player_percentiles.csv", "Oyuncu yüzdelikleri",
@@ -517,9 +552,85 @@ def design(directory: Path) -> Workbook:
                title=title("Clutch: son 5 dakika, fark ≤ 5", "Açık gri: 20 hücumdan az · sıralama şansa açıktır"),
                tooltip_runs=tip("<[none:team:nk]>", NL, "<[none:label:nk]>"))
 
-    sheets = [t1, t2, t3, t4, s1, s2, s3, o1, o2, o3, o4, i1, i2, m1, m2, m3, m4, m5]
+    # -- Güven -------------------------------------------------------------------------------
+    settle = Source("stat_reliability.csv", "Oturma noktası", dimensions=("metric_order",),
+                    captions={"k_games": "Maç", "label": "İstatistik"},
+                    colors={"[none:settles:nk]": {"Çeyrek sezonda": GOOD, "Bir sezon içinde": GOOD_L,
+                                                  "Bir sezon yetmez": GREY}})
+    calib = Source("xpts_calibration.csv", "xPTS kalibrasyonu", dimensions=("bin",),
+                   captions={"xfg": "Beklenen isabet (xFG)", "fg": "Gerçek isabet", "gap": "Gerçek − beklenen"},
+                   colors={"[none:method_label:nk]": {"Geçen + bu sezon": INK, "Kullanılan: yalnız bu sezon (5 katlı)": INK,
+                                                      "Geçen sezonun modeli (dondurulmuş)": GOOD,
+                                                      "Yalnız bu sezon (5 katlı)": GREY}})
+    btest = Source("prior_backtest.csv", "Geçen sezon testi", dimensions=("metric_order", "method_order"),
+                   captions={"value": "Tahmin hatası"},
+                   colors={"[none:method:nk]": {"Ham değer": GREY, "Lig ortalamasıyla": GOOD_L, "+ geçen sezon": GOOD}})
+    stable = Source("player_stable.csv", "Dengeli değerler", dimensions=("metric_order", "col_order"), calcs=[
+        *roster_block(), Calc("profil_filtre", "Profil Filtresi", "[player] = [Calculation_kadro_oyuncu]", "boolean")])
+
+    g0 = Sheet("G0 Kadro", pprof, rows=[F("Calculation_kadro_satir")], cols=[F("minutes", "sum", "qk")], mark="Bar",
+               color=F("Calculation_kadro_renk"), label=[F("minutes", "sum", "qk")],
+               detail=[F("player"), F("team"), F("Calculation_oyuncu_tik"), F("Calculation_kadro_kisa", "attr", "nk")],
+               tooltip=[F("games", "sum", "qk")], filters=[("true", F("Calculation_kadro_filtre"))],
+               sorts=[(F("Calculation_kadro_satir"), F("minutes", "sum", "qk"), "DESC", "rows")],
+               axes=[Axis(F("minutes", "sum", "qk"), "cols", title="Dakika", fmt=FMT_0)],
+               formats={"[sum:minutes:qk]": FMT_0},
+               title=title("Kadro · ", "Bir oyuncuya tıklayın", [("<[attr:Calculation_kadro_kisa:nk]>", T_SHEET)]),
+               tooltip_runs=tip("<[none:player:nk]>", NL, "<[sum:games:qk]>", " maç · ", "<[sum:minutes:qk]>",
+                                " dakika"))
+
+    g1 = Sheet("G1 Dengeli değerler", stable, rows=[F("label")], cols=[F("col")], mark="Text", label=[F("value_text")],
+               detail=[F("player", "attr", "nk"), F("team", "attr", "nk")], tooltip=[F("units_text"), F("weights_text")],
+               filters=[("true", F("Calculation_profil_filtre"))],
+               sorts=[(F("label"), F("metric_order", "min", "ok"), "ASC", "rows"),
+                      (F("col"), F("col_order", "min", "ok"), "ASC", "columns")],
+               title=[("<[attr:player:nk]>", {"fontname": "Tableau Semibold", "fontsize": "14", "fontcolor": INK}),
+                      ("  ·  ", T_SHEET2), ("<[attr:team:nk]>", T_SHEET2), NL,
+                      ("Deneme: şut, hücum ya da fırsat sayısı · * geçen sezon başka bir ligde · "
+                       "ağırlıklar ipucunda", T_SHEET2)],
+               tooltip_runs=tip("<[none:label:nk]>", NL, "<[none:units_text:nk]>", NL, "Dengeli tahminde ağırlık: ",
+                                "<[none:weights_text:nk]>"))
+    g2 = Sheet("G2 Kaç maçta oturur", settle, rows=[F("label")], cols=[F("k_games", "sum", "qk")], mark="Bar",
+               color=F("settles"), label=[F("k_text")], label_cull=False,
+               tooltip=[F("interval_text"), F("season_text")],
+               sorts=[(F("label"), F("k_games", "sum", "qk"), "ASC", "rows")],
+               axes=[Axis(F("k_games", "sum", "qk"), "cols", title="Maç (~25 dk/maç oynayan için)", fmt=FMT_0)],
+               reflines=[RefLine(F("k_games", "sum", "qk"), float(season_games))],
+               title=title("Hangi istatistik kaç maçta oturur?",
+                           f"Bu noktada değerin yarısı beceri, yarısı şans · çizgi: bir sezon ({season_games} maç) · "
+                           f"koyu: çeyrek sezonda, açık: bir sezonda, gri: bir sezon yetmez · {rel_from}"),
+               tooltip_runs=tip("<[none:label:nk]>", NL, "<[none:k_text:nk]>", NL, "%90 aralık: ",
+                                "<[none:interval_text:nk]>", NL, "Sezon sonunda tipik oyuncuda beceri payı: ",
+                                "<[none:season_text:nk]>"))
+    slope_txt = (f"Geçen sezonun modeli bu sezonda: eğim {num(frozen['calibration_slope'], 2)}, sabit "
+                 f"{num(frozen['calibration_intercept'], 2, True)} (ideal 1 ve 0)" if frozen else
+                 f"Eğim {num(cal_used['calibration_slope'], 2)}, sabit {num(cal_used['calibration_intercept'], 2, True)} "
+                 "(ideal 1 ve 0)")
+    per_bin = int(cal.filter(pl.col("used"))["shots"].median())
+    noise = max(1, round(2 * 100 * (0.25 / per_bin) ** 0.5))  # 2 SE of a ~50% FG% over that many shots
+    g3 = Sheet("G3 xPTS kalibrasyonu", calib, cols=[F("xfg", "avg", "qk")], rows=[F("gap", "avg", "qk")], mark="Line",
+               color=F("method_label"), path=F("bin", "none", "ok"), detail=[F("bin", "none", "ok")],
+               tooltip=[F("shots", "sum", "qk"), F("fg", "avg", "qk")],
+               axes=[Axis(F("xfg", "avg", "qk"), "cols", 0.2, 0.8, title="Beklenen isabet (xFG)", fmt=FMT_P0),
+                     Axis(F("gap", "avg", "qk"), "rows", -8, 8, title="Fark (puan)", fmt=FMT_0)],
+               reflines=[RefLine(F("gap", "avg", "qk"), 0.0)],
+               formats={"[avg:xfg:qk]": FMT_P1, "[avg:fg:qk]": FMT_P1, "[avg:gap:qk]": "*+#,##0.0;-#,##0.0"},
+               title=title("xPTS tutuyor mu?", slope_txt + f" · nokta başına ~{per_bin} şut, ±{noise} puan şans"),
+               tooltip_runs=tip("<[none:method_label:nk]>", NL, "Beklenen ", "<[avg:xfg:qk]>", " · gerçek ",
+                                "<[avg:fg:qk]>", NL, "<[sum:shots:qk]>", " şut"))
+    g4 = Sheet("G4 Geçen sezon testi", btest, rows=[F("label")], cols=[F("value", "avg", "qk")], mark="Circle",
+               color=F("method"), detail=[F("method_order", "none", "ok")], tooltip=[F("value_text")],
+               sorts=[(F("label"), F("metric_order", "min", "ok"), "ASC", "rows")],
+               axes=[Axis(F("value", "avg", "qk"), "cols", 0, 110, title="Tahmin hatası (ham değer = 100)", fmt=FMT_0)],
+               reflines=[RefLine(F("value", "avg", "qk"), 100.0)], formats={"[avg:value:qk]": FMT_0}, mark_size=1.2,
+               title=title("Geçen sezon işe yarıyor mu?",
+                           f"İlk 4 maçtan sezonun kalanını tahmin, {bt_n} oyuncu · gri: ham, açık: lig ortalamasıyla, "
+                           "koyu: + geçen sezon"),
+               tooltip_runs=tip("<[none:label:nk]>", NL, "<[none:method:nk]>", ": ", "<[avg:value:qk]>"))
+
+    sheets = [t1, t2, t3, t4, s1, s2, s3, o1, o2, o3, o4, i1, i2, m1, m2, m3, m4, m5, g0, g1, g2, g3, g4]
     sources = [kpis, profiles, factors, starts, shots, pshoot, tshoot, pcard, pprof, pct, pairs, assists,
-               timeline, summary, flow, runs, clutch]
+               timeline, summary, flow, runs, clutch, stable, settle, calib, btest]
 
     # -- dashboards --------------------------------------------------------------------------
     def controls(*ps, widths, x=16, y=72):
@@ -553,7 +664,7 @@ def design(directory: Path) -> Workbook:
         Dashboard("Oyuncular", frame(
             "Oyuncu ligde nerede duruyor?", f"Yüzdelikler {qmin}+ dakika oynayan oyuncular arasında · 0 en alt, 100 en üst",
             "Soldaki çubuklar oyuncunun her metrikte ligdeki yüzdelik dilimi (50 = ortanca). Sağdaki grafikte bir oyuncuya "
-            "tıklayın. On/off tek oyuncu için çok gürültülüdür.", footer)
+            "tıklayın. On/off tek oyuncu için çok gürültülüdür; dengelenmiş değerler Güven sayfasında.", footer)
             + controls(p_team, p_player, widths=[240, 300]) + [
             Zone("sheet", 16, 148, 540, 100, sheet=o1.name),
             Zone("sheet", 16, 252, 540, 522, sheet=o2.name),
@@ -576,11 +687,23 @@ def design(directory: Path) -> Workbook:
             Zone("sheet", 392, 148, 792, 330, sheet=m1.name),
             Zone("sheet", 392, 484, 792, 100, sheet=m2.name, show_title=False),
             Zone("sheet", 392, 590, 792, 184, sheet=m3.name)]),
+        Dashboard("Güven", frame(
+            "Sayılara ne kadar güvenebiliriz?",
+            "Az maçla oranlar şansla oynar · dengeli tahmin bu sezonu geçen sezonla ve lig ortalamasıyla harmanlar",
+            "Takım seçin, kadrodan oyuncuya tıklayın. Tablo ham ve dengeli değerleri, %90 aralık gerçek düzeyin büyük "
+            "olasılıkla nerede olduğunu gösterir. Altta: yöntemin sınaması.",
+            footer, height=GUVEN_H)
+            + controls(p_team, p_player, widths=[240, 300]) + [
+            Zone("sheet", 16, 148, 200, 626, sheet=g0.name),
+            Zone("sheet", 228, 148, 560, 626, sheet=g1.name, fit="fit-width"),
+            Zone("sheet", 800, 148, 384, 626, sheet=g2.name),
+            Zone("sheet", 16, 786, 578, 290, sheet=g3.name),
+            Zone("sheet", 606, 786, 578, 290, sheet=g4.name)], height=GUVEN_H),
         Dashboard("Yöntem", frame("Veri, yöntem ve sözlük", "Bu çalışma nasıl yapıldı, sayılar nasıl okunmalı", None,
                                   footer) + [
             Zone("text", 16, 80, 370, 690, runs=method_veri(n_games, weeks, season, n_teams, span, forfeits)),
             Zone("text", 410, 80, 370, 690, runs=method_sozluk()),
-            Zone("text", 804, 80, 380, 690, runs=method_orneklem(games_txt, rating_se))]),
+            Zone("text", 804, 80, 380, 690, runs=method_orneklem(games_txt, rating_se, cal_used, frozen, rel_from))]),
     ]
     actions = []
 
@@ -597,6 +720,8 @@ def design(directory: Path) -> Workbook:
         click(dash, sh, "team", p_team, "oyuncunun takımı")
     click("İkililer", i2, "Calculation_pas_tik", p_player, "pası veren")
     click("İkililer", i2, "team", p_team, "takım")
+    click("Güven", g0, "Calculation_oyuncu_tik", p_player, "oyuncu")
+    click("Güven", g0, "team", p_team, "oyuncunun takımı")
     click("Maçlar", m4, "match_id", p_match, "maç")
     click("Maçlar", m5, "Calculation_takim_tik", p_team, "takım")
     return Workbook(d, params, sources, sheets, dashboards, actions, start="Takımlar")
@@ -634,11 +759,22 @@ def method_sozluk() -> list[tuple[str, dict]]:
     return runs
 
 
-def method_orneklem(games_txt: str, rating_se: int) -> list[tuple[str, dict]]:
+def method_orneklem(games_txt: str, rating_se: int, cal: dict, frozen: dict | None, rel_from: str
+                    ) -> list[tuple[str, dict]]:
+    model = ("Her şut, kendi maçı dışarıda tutularak geçen sezonun ve bu sezonun öteki maçlarının şutlarıyla "
+             "eğitilen modelden gelir." if cal["method"] == "pooled" else
+             "Her şut, kendi maçı dışarıda tutularak eğitilen modelden gelir (maç bazında 5 katlı çapraz doğrulama).")
+    test = (f" Geçen sezonun modeli hiç değiştirilmeden bu sezona uygulandığında log loss {num(frozen['log_loss'], 3)}, "
+            f"kalibrasyon eğimi {num(frozen['calibration_slope'], 2)}: model sezondan sezona kaymıyor." if frozen else "")
     return [("Örneklem uyarısı", T_H), NL, NL, (
         f"Takım başına {games_txt} maç oynandı. Bir takımın reytingi ±{rating_se}, 100 hücumluk bir ikilinin net "
         "reytingi ±15 kadar şansla oynayabilir (1 standart hata). Clutch'ta takım başına az hücum vardır.", T_BODY), NL, NL, (
         "Bu yüzden oranların yanında hücum, şut ya da dakika sayısı yazar; ipuçlarında şans payı verilir. Şut "
         "haritasında az şutlu altıgenler sıfıra çekilir.", T_BODY), NL, NL, (
-        "xPTS modeli: lojistik regresyon, maç bazında 5 katlı çapraz doğrulama. Log loss 0,647 (bölge isabet "
-        "oranıyla 0,659). Modelin toplam beklentisi atılan sayıya %0,2 yakın.", T_BODY)]
+        f"Dengeli tahmin (Güven sayfası): her istatistiğin kaç denemede oturduğu {rel_from} sezonundan, tek ve çift "
+        "maçların karşılaştırmasıyla ölçüldü. Oyuncunun oranı o kadar lig ortalamasıyla ve geçen sezonuyla "
+        "harmanlanır; geçen sezonun ağırlığı, sezonun ilk maçlarından kalanını tahmin eden bir testle seçildi.",
+        T_BODY), NL, NL, (
+        f"xPTS modeli: lojistik regresyon. {model} Log loss {num(cal['log_loss'], 3)} (sabit isabet oranıyla "
+        f"{num(cal['log_loss_constant'], 3)}); toplam beklenti atılan sayıya "
+        f"%{num(abs(cal['xpts_vs_pts'] - 1) * 100, 1)} yakın.{test}", T_BODY)]

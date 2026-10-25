@@ -46,6 +46,12 @@ def get_season(league: str, key: str) -> Season:
         raise KeyError(f"unknown season {league} {key}; known: {known}") from None
 
 
+def previous_season(season: Season) -> Season | None:
+    """The league's season before this one in the registry (None if it is the first)."""
+    keys = sorted(k for lg, k in SEASONS if lg == season.league and k < season.key)
+    return SEASONS[(season.league, keys[-1])] if keys else None
+
+
 # Hand-written fixes per match (version-controlled, unlike the data)
 OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "overrides"
 
