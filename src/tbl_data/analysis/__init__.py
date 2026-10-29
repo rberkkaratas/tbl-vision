@@ -1,5 +1,6 @@
 """staged + enriched -> analysis tables: xPTS, shooting, team and player profiles, pairs, game flow, clutch,
-and how far each player rate can be trusted (stabilization, rates padded with last season)."""
+how far each player rate can be trusted (stabilization, rates padded with last season) and the
+opponent-scouting matchups (matchup.py)."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 import polars as pl
 import structlog
 
-from . import flow, pairs, profiles, stability, xpts
+from . import flow, matchup, pairs, profiles, stability, xpts
 
 log = structlog.get_logger()
 
@@ -21,18 +22,21 @@ class Analysis:
 
 @dataclass
 class Prior:
-    """Last season: its enriched layer (shots, possessions) and its analysis layer."""
+    """Last season: its enriched layer (shots, possessions), its analysis layer and (for the head-to-head
+    history) its staged matches and teams."""
     season: str
     enriched: dict[str, pl.DataFrame]
     analysis: dict[str, pl.DataFrame]
+    staged: dict[str, pl.DataFrame] | None = None
 
 
 BACKTEST_MIN_TEAM_GAMES = 16  # tune the prior-season weights only on a season this long
 
 
 def analyze(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], prior: Prior | None = None,
-            season: str = "") -> Analysis:
-    """season: its key ('2026-27'), to find last season in TBF's career table."""
+            season: str = "", fixtures: pl.DataFrame | None = None) -> Analysis:
+    """season: its key ('2026-27'), to find last season in TBF's career table. fixtures: upcoming games
+    (match_id, week, start_utc, home_team_id, away_team_id), for the opponent page's default court."""
     mt, ev = staged["match_teams"], enriched["events_enriched"]
     x = xpts.fit(enriched["shots_enriched"], enriched["possessions"],
                  (prior.enriched["shots_enriched"], prior.enriched["possessions"]) if prior else None)
@@ -44,6 +48,9 @@ def analyze(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], 
     games_played = profiles.player_games(staged, enriched, x.shots)
     player_prof, percentiles = profiles.player_profiles(staged, games_played, player_shooting)
     stab = _stability(staged, games_played, prior, season)
+    mx, mx_metrics = matchup.analyze_matchups(
+        staged, enriched, x.shots, clutch_team, prior.analysis if prior else None, prior.staged if prior else None,
+        prior.season if prior else None, season, fixtures)
     tables = {
         "shot_xpts": x.shots.select("match_id", "action_number", "team_season_id", "player_id", "family",
                                     "transition", "value", "pts", "xfg", "xpts"),
@@ -67,10 +74,11 @@ def analyze(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], 
         "clutch_team": clutch_team,
         "clutch_player": clutch_player,
         **stab,
+        **mx,
     }
     log.info("analyze.done", **{k: v.height for k, v in tables.items()}, **{k: x.metrics[k] for k in
              ("log_loss", "log_loss_zone_baseline", "xpts_per_shot", "pts_per_shot")})
-    return Analysis(tables, {"xpts": x.metrics, "stability": {
+    return Analysis(tables, {"xpts": x.metrics, "matchup": mx_metrics, "stability": {
         "reliability_from": stab["stat_reliability"]["fitted_on"][0],
         "weights_from": stab["prior_weights"]["fitted_on"][0] if stab["prior_weights"].height else None,
         "prior_season": prior.season if prior else None}})

@@ -146,14 +146,18 @@ def analyze(
     prior = None
     if (ps := previous_season(s)) is not None:
         try:
-            prior = Prior(ps.key, B.read_layer(root, "enriched", ps), B.read_layer(root, "analysis", ps))
+            prior = Prior(ps.key, B.read_layer(root, "enriched", ps), B.read_layer(root, "analysis", ps),
+                          B.read_layer(root, "staged", ps))
         except FileNotFoundError:
             typer.echo(f"no analysed {ps.key} season: xPTS and player rates use this season only")
         else:
             if "player_games" not in prior.analysis:
                 typer.echo(f"{ps.key} analysis predates player_games: run `tbl analyze --season {ps.key}` first")
                 raise typer.Exit(1)
-    a = run_analysis(staged, enriched, prior, s.key)
+    m = Manifest(root / "manifest.sqlite")
+    fixtures = upcoming(m, f"{s.league}/{s.key}")
+    m.close()
+    a = run_analysis(staged, enriched, prior, s.key, fixtures)
     out = B.write_layer(root, "analysis", s, a.tables)
     (out / "metrics.json").write_text(json.dumps(a.metrics, indent=2))
     typer.echo(f"\nanalysis -> {out}")
@@ -162,7 +166,15 @@ def analyze(
     typer.echo(f"\nxPTS model: {json.dumps(a.metrics['xpts'])}")
     if tableau:
         tdir = root / "tableau" / f"{s.league}-{s.key}"
-        n = export(staged, enriched, a.tables, tdir)
+        from .analysis import assets
+
+        try:  # team logos once (FIBA LiveStats) and the TBL logo, into Tableau's shape palette
+            logos = assets.fetch_logos(root, staged["matches"], staged["teams"])
+            typer.echo(f"logos -> {assets.install_shapes(logos)}")
+        except OSError as e:
+            logos = None
+            typer.echo(f"logos not fetched ({e}): team colours from TBF, no logos")
+        n = export(staged, enriched, a.tables, tdir, a.metrics, logos)
         typer.echo(f"\ntableau -> {tdir}  ({', '.join(f'{k} {v}' for k, v in n.items())}, court.png)")
     checks = V.run_analysis(staged, enriched, a.tables, a.metrics)
     typer.echo("\nvalidation")
@@ -174,6 +186,19 @@ def analyze(
             typer.echo(f"\n{c.name}:\n{c.failures.head(5)}")
     if any(c.blocking and not c.ok for c in checks):
         raise typer.Exit(1)
+
+
+def upcoming(m: Manifest, scope: str):
+    """Unplayed fixture games (the opponent page defaults to the next one)."""
+    import polars as pl
+
+    rows = [{"match_id": r["match_id"], "week": int(str(r["week"]).split(".")[0]) if r["week"] else None,
+             "start_utc": r["match_start"], "home_team_id": r["home_team_id"], "away_team_id": r["away_team_id"]}
+            for r in m.matches(scope) if not r["played"] and r["home_team_id"] and r["away_team_id"]]
+    schema = {"match_id": pl.Int32, "week": pl.Int32, "start_utc": pl.String, "home_team_id": pl.Int32,
+              "away_team_id": pl.Int32}
+    return pl.DataFrame(rows, schema=schema).with_columns(
+        pl.col("start_utc").str.to_datetime(time_zone="UTC", time_unit="us"))
 
 
 @app.command()

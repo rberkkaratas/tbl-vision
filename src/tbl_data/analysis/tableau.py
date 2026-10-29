@@ -9,11 +9,14 @@ court (0-15, sideline to sideline), plot_y = metres from the attacked baseline (
 from __future__ import annotations
 
 import math
+import shutil
 from pathlib import Path
 
 import polars as pl
 
-from .presentation import augment, team_codes
+from .assets import TBL, team_theme
+from .glossary import annotate
+from .presentation import augment, matchup_views, team_codes
 from .profiles import player_names
 
 COURT_W, HALF_L = 15.0, 14.0
@@ -30,7 +33,8 @@ FOUR_FACTORS = [("efg", "eFG%", "Hücum", 1), ("tov_pct", "Top kaybı %", "Hücu
 
 
 def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], tables: dict[str, pl.DataFrame],
-           out: Path) -> dict[str, int]:
+           out: Path, metrics: dict | None = None, logos: Path | None = None) -> dict[str, int]:
+    """logos: the folder assets.fetch_logos filled (team colours come from the logos; without it, from TBF)."""
     out.mkdir(parents=True, exist_ok=True)
     teams = staged["teams"].select("team_season_id", team="name", team_code="code")
     opp = staged["teams"].select(opponent_id="team_season_id", opponent="name")
@@ -94,7 +98,24 @@ def export(staged: dict[str, pl.DataFrame], enriched: dict[str, pl.DataFrame], t
         "prior_backtest": tables["prior_backtest"],
         "player_stable": tables["player_stable"].join(names, on="player_id").join(teams, on="team_season_id"),
     }
-    files = augment(files, team_codes(staged["teams"]))
+    codes = team_codes(staged["teams"])
+    files = augment(files, codes)
+    display = {(t, p): n for t, p, n in files["player_profiles"].select("team_season_id", "player_id", "player").iter_rows()}
+    files |= matchup_views(tables, dict(staged["teams"].select("team_season_id", "name").iter_rows()), codes, names,
+                           metrics, display)
+    files = annotate(files)  # what each metric means, for the tooltips
+    theme = team_theme(staged["teams"], codes, logos)
+    files["team_theme"] = pl.concat([theme, pl.DataFrame([{"team": TBL, "team_short": TBL, "color": "#1b2430",
+                                                           "color_light": "#b4bcc5", "color_dark": "#1b2430",
+                                                           "logo": f"{TBL}.png"}])])
+    # the header block is an area chart over two points per team, so it fills its zone in the team's colour
+    files["theme_band"] = pl.concat([theme.select("team", x=pl.lit(v), y=pl.lit(1.0)) for v in (0.0, 1.0)])
+    if logos is not None:  # logos embedded as shapes; the wide league logo is the header image
+        (out / "logos").mkdir(exist_ok=True)
+        for f in logos.glob("*.png"):
+            shutil.copy2(f, out / "logos" / f.name)
+        if (logos.parent / f"{TBL}_wide.png").exists():
+            shutil.copy2(logos.parent / f"{TBL}_wide.png", out / f"{TBL}.png")
     for name, df in files.items():
         df.write_csv(out / f"{name}.csv")
     court_image(out / "court.png")

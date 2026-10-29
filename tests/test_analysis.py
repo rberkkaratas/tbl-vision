@@ -75,8 +75,14 @@ def test_tableau_export_writes_a_consistent_workbook(staged, tmp_path):
     a = analyze(staged.tables, e)
     export(staged.tables, e, a.tables, tmp_path / "tbl-test")
     root = ET.parse(tmp_path / "tbl-test" / "tbl-test.twb").getroot()
-    assert len(root.find("worksheets")) == 23 and len(root.find("dashboards")) == 7
+    assert len(root.find("worksheets")) == 48 and len(root.find("dashboards")) == 9
+    for db in root.find("dashboards"):  # Tableau rejects a dashboard that shows one sheet twice
+        names = [z.get("name") for z in db.iter("zone") if z.get("name") and not z.get("type-v2")]
+        assert len(names) == len(set(names)), (db.get("name"), names)
     assert root.find("actions") is not None and len(root.find("actions")) >= 10  # click a mark -> set a parameter
+    order = {"action": 0, "nav-action": 1, "edit-parameter-action": 2}  # the sequence Tableau's schema requires
+    kinds = [order[a.tag] for a in root.find("actions")]
+    assert 1 in kinds and kinds == sorted(kinds)
     for ws in root.find("worksheets"):  # every field on a shelf is declared in the sheet
         declared = {ci.get("name") for ci in ws.iter("column-instance")}
         used = set(re.findall(r"\]\.(\[[a-z]+:[^\]]+:[nqo]k\])", ET.tostring(ws, encoding="unicode")))

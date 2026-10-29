@@ -98,6 +98,8 @@ class Source:
     captions: dict[str, str] = field(default_factory=dict)
     # colour per value of a field: a row-level field as "[none:name:nk]", an aggregate calc by its bare name
     colors: dict[str, dict[str, str]] = field(default_factory=dict)
+    # shape per value of a field, "<palette folder>/<file>" in My Tableau Repository/Shapes (team logos)
+    shapes: dict[str, dict[str, str]] = field(default_factory=dict)
     image: tuple[str, str, str, tuple[float, float, float, float]] | None = None  # (file, x, y, (left, right, bottom, top))
     columns: dict[str, str] = field(default_factory=dict)  # filled from the CSV: name -> datatype
 
@@ -169,11 +171,13 @@ class Sheet:
     tooltip_runs: list[tuple[str, dict]] | None = None
     mark_size: float | None = None
     hide_headers: list[F] = field(default_factory=list)
+    plain: bool = False  # no grid or zero lines (a view used as a coloured surface)
+    opacity: int | None = None  # mark opacity 0-255 (Tableau's mark-transparency; areas default to see-through)
 
 
 @dataclass
 class Zone:
-    kind: str  # sheet / text / param / legend / nav / blank
+    kind: str  # sheet / text / param / legend / nav / blank / image
     x: int
     y: int
     w: int
@@ -189,6 +193,8 @@ class Zone:
     map_controls: bool = True  # zoom/pan toolbar on views with a background image
     background: str | None = None
     title: str | None = None
+    image: str | None = None  # image: the picture file (absolute path)
+    margin: int | None = None  # padding inside the zone; default 4 for views and controls, else 0
 
 
 @dataclass
@@ -208,6 +214,16 @@ class ParamAction:
     param: Param
 
 
+@dataclass
+class GoTo:
+    """Go to Sheet: clicking a mark on `sheet` opens the dashboard `target` (a <nav-action>; it filters
+    nothing, unlike a filter action aimed at another dashboard, whose filter stays behind)."""
+    caption: str
+    dashboard: str
+    sheet: str
+    target: str
+
+
 # -- writer -----------------------------------------------------------------------------
 DATATYPES = {pl.Int8: "integer", pl.Int16: "integer", pl.Int32: "integer", pl.Int64: "integer", pl.UInt32: "integer",
              pl.UInt64: "integer", pl.Float32: "real", pl.Float64: "real", pl.Boolean: "boolean", pl.Date: "date",
@@ -218,11 +234,13 @@ HYPER_TYPES = {"string": ("TEXT", "129"), "integer": ("BIG_INT", "20"), "real": 
 
 class Workbook:
     def __init__(self, directory: Path, params: list[Param], sources: list[Source], sheets: list[Sheet],
-                 dashboards: list[Dashboard], actions: list[ParamAction], locale: str = "tr_TR",
-                 start: str | None = None):
+                 dashboards: list[Dashboard], actions: list[ParamAction | GoTo], locale: str = "tr_TR",
+                 start: str | None = None, shape_files: dict[str, Path] | None = None):
+        """shape_files: custom shapes embedded in the workbook, '<palette>/<file>' -> image file."""
         self.dir = directory.resolve()
         self.params, self.sources, self.sheets = params, sources, sheets
         self.dashboards, self.actions, self.locale, self.start = dashboards, actions, locale, start
+        self.shape_files = shape_files or {}
         for i, p in enumerate(params, 1):
             p.name = f"Parameter {i}"
         self.by_caption = {p.caption: p for p in params}
@@ -307,7 +325,7 @@ class Workbook:
             dt, role, typ = s.kind(c)
             ET.SubElement(ds, "column", {**({"caption": s.captions[c]} if c in s.captions else {}), "datatype": dt,
                                          "name": f"[{c}]", "role": role, "type": typ})
-        for key in s.colors:  # a [none:x:nk] colour key needs its column instance declared here
+        for key in {**s.colors, **s.shapes}:  # a [none:x:nk] key needs its column instance declared here
             if key.startswith("[none:"):
                 col = key[6:-4]
                 ET.SubElement(ds, "column-instance", column=f"[{col}]", derivation="None", name=key, pivot="key",
@@ -322,13 +340,14 @@ class Workbook:
         ds.append(self._extract(s, self._write_extract(s)))
         ET.SubElement(ds, "layout", {"dim-ordering": "alphabetic", "measure-ordering": "alphabetic",
                                      "show-structure": "true"})
-        if s.colors:
+        if s.colors or s.shapes:
             rule = ET.SubElement(ET.SubElement(ds, "style"), "style-rule", element="mark")
-            for fld, mapping in s.colors.items():
-                enc = ET.SubElement(rule, "encoding", attr="color", type="palette",
-                                    field=fld if fld.startswith("[") else f"[{fld}]")
-                for v, hexv in mapping.items():
-                    ET.SubElement(ET.SubElement(enc, "map", to=hexv), "bucket").text = _q(v)
+            for attr, kind, maps in (("color", "palette", s.colors), ("shape", "shape", s.shapes)):
+                for fld, mapping in maps.items():
+                    enc = ET.SubElement(rule, "encoding", attr=attr, type=kind,
+                                        field=fld if fld.startswith("[") else f"[{fld}]")
+                    for v, to in mapping.items():
+                        ET.SubElement(ET.SubElement(enc, "map", to=to), "bucket").text = _q(v)
         obj = ET.SubElement(ET.SubElement(ET.SubElement(ds, "object-graph"), "objects"), "object",
                             caption=s.file, id=f"{s.file}_{_id('obj', s.file, n=32).upper()}")
         relation(ET.SubElement(obj, "properties", context=""), with_conn=True)
@@ -468,6 +487,11 @@ class Workbook:
         rule = ET.SubElement(style, "style-rule", element="worksheet")
         ET.SubElement(rule, "format", attr="display-field-labels", scope="rows", value="false")
         ET.SubElement(rule, "format", attr="display-field-labels", scope="cols", value="false")
+        if sh.plain:
+            for element in ("gridline", "zeroline"):
+                rule = ET.SubElement(style, "style-rule", element=element)
+                for scope in ("cols", "rows"):
+                    ET.SubElement(rule, "format", attr="line-visibility", scope=scope, value="off")
         if sh.hide_headers:
             rule = ET.SubElement(style, "style-rule", element="header")
             for f in sh.hide_headers:
@@ -513,6 +537,8 @@ class Workbook:
             ET.SubElement(mrule, "format", attr="line-interpolation", value="step")
         if sh.mark_size is not None:
             ET.SubElement(mrule, "format", attr="size", value=repr(sh.mark_size))
+        if sh.opacity is not None:
+            ET.SubElement(mrule, "format", attr="mark-transparency", value=str(sh.opacity))
 
         def shelf(fs: list[F]) -> str | None:
             if not fs:
@@ -570,13 +596,17 @@ class Workbook:
                 ET.SubElement(vs, "button-caption-font-style", fontcolor="#ffffff" if current else "#1b2430",
                               fontname="Tableau Medium", fontsize="9")
                 ET.SubElement(vs, "format", attr="background-color", value="#1b2430" if current else "#eef1f4")
+            elif z.kind == "image":
+                zone = ET.SubElement(root, "zone", {**geo, "is-centered": "1", "is-scaled": "1", "param": z.image,
+                                                    "type-v2": "bitmap"})
             else:  # blank
                 zone = ET.SubElement(root, "zone", {**geo, "type-v2": "empty"})
             zs = ET.SubElement(zone, "zone-style")
             ET.SubElement(zs, "format", attr="border-color", value="#000000")
             ET.SubElement(zs, "format", attr="border-style", value="none")
             ET.SubElement(zs, "format", attr="border-width", value="0")
-            ET.SubElement(zs, "format", attr="margin", value="4" if z.kind in ("sheet", "param", "legend") else "0")
+            margin = z.margin if z.margin is not None else 4 if z.kind in ("sheet", "param", "legend") else 0
+            ET.SubElement(zs, "format", attr="margin", value=str(margin))
             if z.background:
                 ET.SubElement(zs, "format", attr="background-color", value=z.background)
         ET.SubElement(el, "simple-id", uuid=_uuid("db", d.name))
@@ -584,8 +614,12 @@ class Workbook:
 
     def _actions(self) -> ET.Element:
         acts = ET.Element("actions")
-        for a in self.actions:
+        # the schema's order (tablangres XSD): filter <action>s, then nav-actions, then edit-parameter-actions
+        for a in sorted(self.actions, key=lambda x: not isinstance(x, GoTo)):
             sheet = next(s for s in self.sheets if s.name == a.sheet)
+            if isinstance(a, GoTo):
+                self._goto(acts, a, sheet)
+                continue
             el = ET.SubElement(acts, "edit-parameter-action", caption=a.caption,
                                name=f"[Action_{_id('act', a.caption, a.dashboard, a.sheet, a.param.caption, n=32).upper()}]")
             ET.SubElement(el, "activation", type="on-select")
@@ -596,6 +630,14 @@ class Workbook:
             ET.SubElement(ps, "param", name="source-field", value=self._ref(sheet.source, a.source))
             ET.SubElement(ps, "param", name="target-parameter", value=a.param.ref)
         return acts
+
+    def _goto(self, acts: ET.Element, a: GoTo, sheet: Sheet) -> None:
+        el = ET.SubElement(acts, "nav-action", caption=a.caption,
+                           name=f"[Action_{_id('goto', a.caption, a.dashboard, a.sheet, a.target, n=32).upper()}]")
+        ET.SubElement(el, "activation", type="on-select")
+        ET.SubElement(el, "source", dashboard=a.dashboard, type="sheet", worksheet=a.sheet)
+        # as Tableau saves a Go to Sheet action (no worksheet attribute = every sheet on the dashboard)
+        ET.SubElement(ET.SubElement(el, "params"), "param", name="sheet", value=a.target)
 
     def _windows(self) -> ET.Element:
         wins = ET.Element("windows", {"source-height": "30"})
@@ -656,6 +698,12 @@ class Workbook:
         for d in self.dashboards:
             dbs.append(self._dashboard(d))
         wb.append(self._windows())
+        if self.shape_files:  # custom shapes travel inside the workbook (schema: Shapes-G, after windows)
+            import base64
+
+            shapes = ET.SubElement(ET.SubElement(wb, "external"), "shapes")
+            for name, f in self.shape_files.items():
+                ET.SubElement(shapes, "shape", name=name).text = base64.b64encode(f.read_bytes()).decode()
         tree = ET.ElementTree(wb)
         ET.indent(tree, "  ")
         with open(path, "wb") as fh:
