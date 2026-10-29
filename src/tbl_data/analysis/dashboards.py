@@ -1,11 +1,12 @@
 """What the Tableau workbook shows: parameters, data sources with their calculated fields,
 worksheets, dashboards and click actions (written to XML by workbook.py).
 
-Design: grey for everything, orange for the selection, blue/red only for better/worse than
-the league. Parameters (Takım, Oyuncu, Maç, ...) connect every data source: each source has
-calculated fields that read them, and clicking a team, a player or a game sets them
-(clicking the selected one again clears it). Text a viewer reads is pre-formatted in Turkish
-(presentation.py); the workbook locale is tr_TR so axis numbers use decimal commas.
+Design: one main team (Ana takım, chosen on Anasayfa) shapes every page and lends its colour
+to the header; grey cards on a neutral canvas, the team colour as the accent. Parameters (Ana
+takım, Rakip, Oyuncu, Maç, ...) connect every data source: each source has calculated fields
+that read them, and clicking a team, a player or a game sets them. Text a viewer reads is
+pre-formatted in Turkish (presentation.py) and describes rather than judges; the workbook
+locale is tr_TR so axis numbers use decimal commas.
 """
 
 from __future__ import annotations
